@@ -293,18 +293,16 @@ fn calculate_day(
         .iter()
         .find(|(_, kind)| is_unlock(kind))
         .map(|(time, _)| *time);
-    let last_unlock = instants
-        .iter()
-        .rev()
-        .find(|(_, kind)| is_unlock(kind))
-        .map(|(time, _)| *time);
     let end = instants
         .iter()
         .rev()
-        .find(|(time, kind)| {
-            is_lock(kind) && last_unlock.map(|unlock| *time > unlock).unwrap_or(true)
-        })
+        .find(|(_, kind)| is_lock(kind))
         .map(|(time, _)| *time);
+    let completed_end = end.filter(|end| {
+        !instants
+            .iter()
+            .any(|(time, kind)| is_unlock(kind) && time > end)
+    });
     let reached_cutoff = now >= cutoff(day);
     let workday = kind == "workday";
     let expected = start.map(|time| time + Duration::hours(9));
@@ -317,9 +315,9 @@ fn calculate_day(
         } else {
             "待补录"
         }
-    } else if end.is_some() {
+    } else if completed_end.is_some() {
         if workday
-            && end.zip(expected).is_some_and(|(end, expected)| {
+            && completed_end.zip(expected).is_some_and(|(end, expected)| {
                 let expected = expected.time();
                 let end = end.time();
                 end <= NaiveTime::from_hms_opt(18, 0, 0).unwrap()
@@ -337,7 +335,7 @@ fn calculate_day(
         "进行中"
     }
     .to_string();
-    let calculation_end = end.or_else(|| reached_cutoff.then(|| cutoff(day)));
+    let calculation_end = completed_end.or_else(|| reached_cutoff.then(|| cutoff(day)));
     let raw_duration = match (start, calculation_end, expected, workday) {
         (Some(_start), Some(end), Some(expected), true) => end - expected,
         (Some(start), Some(end), _, false) => end - start,
@@ -882,9 +880,28 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json
     let info = calendar_info(&db, None)?;
     let autostart = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
     let path = data_file(&app)?;
+    let intro_shown: Option<String> = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='intro_shown'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
     Ok(
-        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date}),
+        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1")}),
     )
+}
+
+#[tauri::command]
+fn complete_intro(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO metadata(key,value) VALUES('intro_shown','1') ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1069,21 +1086,7 @@ fn tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开考勤记录", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
-    let mut rgba = vec![0u8; 32 * 32 * 4];
-    for y in 0..32 {
-        for x in 0..32 {
-            let i = (y * 32 + x) * 4;
-            let on = (x >= 5 && x < 27 && y >= 5 && y < 27)
-                || ((x == 10 || x == 21) && y >= 9 && y < 23)
-                || (y == 15 && x >= 10 && x < 22);
-            rgba[i..i + 4].copy_from_slice(if on {
-                &[32, 124, 93, 255]
-            } else {
-                &[0, 0, 0, 0]
-            });
-        }
-    }
-    let icon = tauri::image::Image::new_owned(rgba, 32, 32);
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
@@ -1174,6 +1177,7 @@ fn main() {
             import_backup,
             export_csv,
             get_settings,
+            complete_intro,
             set_autostart
         ]);
     builder
@@ -1415,5 +1419,19 @@ mod tests {
         assert_eq!(record.end_time, None);
         assert_eq!(record.status, "整夜未锁");
         assert_eq!(record.overtime_minutes, 450);
+    }
+
+    #[test]
+    fn latest_lock_remains_visible_when_followed_by_unlock() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        let events = vec![
+            event("2026-11-10T09:09:00", "unlock"),
+            event("2026-11-10T19:56:03", "lock"),
+            event("2026-11-10T19:56:05", "unlock"),
+        ];
+        let record = calculate_day(day, "workday", &events, day.and_hms_opt(20, 0, 0).unwrap());
+        assert_eq!(record.end_time.as_deref(), Some("19:56"));
+        assert_eq!(record.status, "进行中");
+        assert_eq!(record.overtime_minutes, 0);
     }
 }

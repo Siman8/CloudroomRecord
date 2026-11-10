@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "考勤记录",
-  "version": "0.1.0",
-  "identifier": "com.mycardrecord.attendance",
+  "version": "1.0.0",
+  "identifier": "com.cloudroom.cardrecord",
   "build": {
     "frontendDist": "../ui"
   },

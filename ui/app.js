@@ -15,6 +15,8 @@ let monthRecords = [];
 let currentRecord = null;
 let toastTimer;
 let firstOpenDate = isoDate(today);
+let liveOvertimeExpectedEnd = null;
+let liveOvertimeBaseMinutes = 0;
 
 function setToast(message, type = 'success') {
   const el = $('toast'); el.textContent = message; el.className = `toast show ${type}`;
@@ -58,7 +60,12 @@ function renderRecord(r, events) {
   $('metric-expected').textContent = r.expected_end || '--:--';
   $('metric-end').textContent = r.end_time || '--:--';
   $('metric-overtime').innerHTML = `${(r.overtime_minutes/60).toFixed(r.overtime_minutes%60 ? 1 : 0)}<span>小时</span>`;
-  $('overtime-detail').textContent = r.day_type === 'workday' ? (r.overtime_minutes ? `累计 ${r.overtime_minutes} 分钟` : '工作日需满 2 小时才计加班') : '休息日首尾跨度按半小时累计';
+  const todayRecordIsOpen = selected === isoDate(new Date()) && r.status === '进行中' && !r.manual;
+  liveOvertimeExpectedEnd = r.day_type === 'workday' && todayRecordIsOpen && r.expected_end
+    ? new Date(`${selected}T${r.expected_end}:00`)
+    : null;
+  liveOvertimeBaseMinutes = r.overtime_minutes;
+  updateLiveOvertime();
   const subtitles = {
     '正常':'已根据本机锁屏、解锁及开关机事件完成计算',
     '进行中':'当天记录仍在进行，后续锁屏或关机时会补记下班时间',
@@ -75,12 +82,27 @@ function renderRecord(r, events) {
   $('edit-overtime').value = (r.overtime_minutes / 60) || 0; $('edit-note').value = r.note || '';
   $('source-note').textContent = r.manual ? '数据来源：人工修改' : '数据来源：系统事件 / 规则计算';
   $('event-count').textContent = `${events.length} 条`;
-  $('event-list').innerHTML = events.length ? events.map(e => {
+  $('event-list').innerHTML = events.length ? [...events].sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp)).map(e => {
     const t = new Date(e.timestamp).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
     const lock = e.kind === 'lock' || e.kind === 'shutdown';
-    const label = e.kind === 'shutdown' ? '系统关机' : e.kind === 'startup' ? '系统启动' : lock ? '锁定电脑' : '解锁电脑';
+    const label = e.kind === 'shutdown' ? '系统关机时间' : e.kind === 'startup' ? '系统开机时间' : lock ? '锁定电脑' : '解锁电脑';
     return `<div class="event-row ${lock?'lock':''}"><i class="event-dot"></i><span class="event-kind">${label}${e.source === 'manual'?' · 手动':''}</span><time class="event-time">${t}</time></div>`;
-  }).join('') : '<div class="empty-state">尚无系统锁定/解锁事件<br>可同步系统记录，或直接填写当日时间</div>';
+  }).join('') : '<div class="empty-state">尚无锁屏、解锁或开关机事件<br>可同步系统记录，或直接填写当日时间</div>';
+}
+function updateLiveOvertime() {
+  if (!liveOvertimeExpectedEnd || Number.isNaN(liveOvertimeExpectedEnd.getTime())) return;
+  const now = new Date();
+  if (isoDate(now) !== selected) { liveOvertimeExpectedEnd = null; return; }
+  const elapsedSeconds = Math.floor((now - liveOvertimeExpectedEnd) / 1000);
+  if (elapsedSeconds < 2 * 60 * 60) return;
+  const intervalSeconds = 30 * 60;
+  const intervals = Math.floor(elapsedSeconds / intervalSeconds);
+  const countableMinutes = Math.max(liveOvertimeBaseMinutes, intervals * 30);
+  $('metric-overtime').innerHTML = `${(countableMinutes / 60).toFixed(countableMinutes % 60 ? 1 : 0)}<span>小时</span>`;
+  const hours = Math.floor(elapsedSeconds / 3600);
+  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+  const seconds = elapsedSeconds % 60;
+  $('overtime-detail').textContent = `实时加班 ${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }
 async function loadMonth() {
   const year = viewMonth.getFullYear(), month = viewMonth.getMonth()+1;
@@ -164,7 +186,8 @@ async function loadSettings() {
     const s=await invoke('get_settings'); firstOpenDate=s.first_open_date||firstOpenDate; $('autostart').checked=s.autostart; $('data-path').textContent=s.data_path; updateSyncAvailability();
     $('calendar-status').textContent=s.calendar.last_sync?`上次同步：${new Date(s.calendar.last_sync).toLocaleString('zh-CN')}`:'尚无同步信息';
     $('calendar-years').textContent=s.calendar.cached_years.length?`已缓存年份：${s.calendar.cached_years.join('、')}`:'尚无本地日历缓存';
-  } catch(e) { setToast(String(e),'error'); }
+    return s;
+  } catch(e) { setToast(String(e),'error'); return null; }
 }
 function updateSyncAvailability() {
   const button=$('sync-now');
@@ -194,10 +217,17 @@ $('autostart').addEventListener('change',async e=>{try{await invoke('set_autosta
 $('export-csv').addEventListener('click',async()=>{try{const csv=await invoke('export_csv',{year:viewMonth.getFullYear(),month:viewMonth.getMonth()+1});downloadFile(`考勤记录-${viewMonth.getFullYear()}-${pad(viewMonth.getMonth()+1)}.csv`,'\ufeff'+csv,'text/csv;charset=utf-8');}catch(e){setToast(String(e),'error');}});
 $('backup-export').addEventListener('click',async()=>{try{const json=await invoke('export_backup');downloadFile(`考勤备份-${isoDate(new Date())}.json`,json,'application/json;charset=utf-8');setToast('备份文件已导出');}catch(e){setToast(String(e),'error');}});
 $('backup-import').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{await invoke('import_backup',{data:await file.text()});setToast('备份已导入');await loadRecord();await loadMonth();}catch(err){setToast(String(err),'error');}finally{e.target.value='';}});
+$('intro-confirm').addEventListener('click',async()=>{
+  try { await invoke('complete_intro'); $('intro-dialog').classList.add('hidden'); }
+  catch (error) { setToast(String(error),'error'); }
+});
 window.addEventListener('DOMContentLoaded',async()=>{
+  setInterval(updateLiveOvertime, 1000);
   $('selected-date').value=selected;
   $('sync-now').disabled=true;
   if (!tauriInvoke) setToast('当前是界面预览模式；数据功能需要在 Tauri 桌面窗口中运行。','error');
-  await loadRecord(); await loadMonth(); await loadSettings();
+  await loadRecord(); await loadMonth();
+  const settings=await loadSettings();
+  if (settings?.intro_pending) $('intro-dialog').classList.remove('hidden');
 });
 

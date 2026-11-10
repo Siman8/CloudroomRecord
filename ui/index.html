@@ -11,7 +11,7 @@
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">时</span><div><strong>考勤记录</strong><small>本地工作台</small></div></div>
+      <div class="brand"><img class="brand-mark" src="./logo.svg" alt=""><div><strong>考勤记录</strong><small>本地工作台</small></div></div>
       <nav class="nav-list" aria-label="主导航">
         <button class="nav-item active" data-view="today"><span class="nav-icon">◷</span>今日概览</button>
         <button class="nav-item" data-view="calendar"><span class="nav-icon">▦</span>月度日历</button>
@@ -57,6 +57,18 @@
       <section id="view-settings" class="view"><div class="settings-layout"><section class="panel settings-panel"><div class="panel-heading"><div><h3>应用设置</h3><p>后台运行与系统集成</p></div></div><label class="setting-row"><div><strong>开机时自动启动</strong><small>登录 Windows 后在后台运行</small></div><input id="autostart" type="checkbox" class="switch"></label><div class="setting-row readonly"><div><strong>数据存储位置</strong><small id="data-path">读取中…</small></div></div><div class="setting-row readonly"><div><strong>系统事件来源</strong><small>Windows Winlogon 会话日志（普通用户可读取）</small></div></div><div class="setting-row readonly"><div><strong>异常截止时间</strong><small>次日 02:00，之后事件不计入前一日</small></div></div></section>
         <section class="panel settings-panel"><div class="panel-heading"><div><h3>工作日日历</h3><p>调休补班数据按年度缓存，人工日期优先</p></div></div><div class="calendar-info"><strong id="calendar-status">尚无同步信息</strong><small id="calendar-years"></small></div><div class="settings-actions"><button id="calendar-sync-settings" class="button secondary">同步今年日历</button><button id="backup-export" class="button secondary">导出备份</button><label class="button secondary file-button">导入备份<input type="file" id="backup-import" accept="application/json,.json" hidden></label></div><p class="help-text">节假日数据使用 timor.tech 年度日历接口；失败时保留已缓存数据，可继续手动设置日期。</p></section></div></section>
     </main>
+  </div>
+  <div id="intro-dialog" class="intro-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="intro-title">
+    <section class="intro-panel">
+      <img class="intro-logo" src="./logo.svg" alt="">
+      <div class="intro-heading"><span class="eyebrow">欢迎使用</span><h2 id="intro-title">考勤记录如何工作</h2></div>
+      <div class="intro-copy">
+        <p>首次启动时，软件会尝试从 Windows 系统事件日志同步此前月份的锁屏、解锁、启动和关机记录；你也可以在月度日历中手动同步历史月份。</p>
+        <p>之后软件在后台每分钟检查最近两天的系统事件，将记录保存在本机数据库，并据此更新上下班与加班时长。到预计下班时间或发现整夜未锁等情况时，会发送系统通知。</p>
+        <p class="intro-privacy">数据保存在本机，不会上传到考勤服务。系统日志不可读取或事件缺失时，可手动补录或修改。</p>
+      </div>
+      <div class="intro-footer"><span>作者：Siman</span><button id="intro-confirm" class="button primary" type="button">开始使用</button></div>
+    </section>
   </div>
   <script src="./app.js"></script>
 </body>
