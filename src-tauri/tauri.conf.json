@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "考勤记录",
+  "version": "0.1.0",
+  "identifier": "com.mycardrecord.attendance",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "考勤记录",
+        "width": 1350,
+        "height": 950,
+        "minWidth": 980,
+        "minHeight": 680,
+        "resizable": true,
+        "center": true,
+        "backgroundColor": "#f5f7f6"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico"],
+    "shortDescription": "个人考勤与加班记录",
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,15 @@
+{
+  "name": "mycardrecord",
+  "private": true,
+  "version": "0.1.0",
+  "description": "个人本地考勤与加班记录工具",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 dev",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
+

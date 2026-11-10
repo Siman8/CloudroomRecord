@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;">
+  <title>考勤记录</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./calendar.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">时</span><div><strong>考勤记录</strong><small>本地工作台</small></div></div>
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-view="today"><span class="nav-icon">◷</span>今日概览</button>
+        <button class="nav-item" data-view="calendar"><span class="nav-icon">▦</span>月度日历</button>
+        <button class="nav-item" data-view="stats"><span class="nav-icon">▤</span>统计报表</button>
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span>设置与数据</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="privacy-dot"></span><span>数据仅保存在此设备</span></div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar">
+        <div><div class="eyebrow" id="top-eyebrow">考勤工作台</div><h1 id="page-title">今日概览</h1></div>
+        <div class="top-actions" id="top-actions"><label class="date-picker"><span>日期</span><input id="selected-date" type="date"></label><button id="sync-now" class="button secondary"><span class="button-icon">↻</span>同步当日事件</button></div>
+      </header>
+      <div id="toast" class="toast" role="status"></div>
+      <section id="view-today" class="view active-view">
+        <div class="day-banner"><div><span class="banner-kicker" id="today-long-date"></span><h2 id="banner-title">今天的考勤</h2><p id="banner-subtitle">正在读取本机锁定与解锁记录</p></div><div class="day-type-wrap"><span class="label">日期类型</span><select id="day-type"><option value="workday">工作日</option><option value="restday">休息日</option><option value="auto">自动判断</option></select></div></div>
+        <div class="metric-grid">
+          <article class="metric"><div class="metric-head"><span>上班时间</span><span class="metric-glyph green">↗</span></div><strong id="metric-start">--:--</strong><small>当天最早解锁</small></article>
+          <article class="metric"><div class="metric-head"><span>预计下班</span><span class="metric-glyph blue">◷</span></div><strong id="metric-expected">--:--</strong><small>按上班时间 + 9 小时</small></article>
+          <article class="metric"><div class="metric-head"><span>实际下班</span><span class="metric-glyph orange">↙</span></div><strong id="metric-end">--:--</strong><small>当天最后锁屏</small></article>
+          <article class="metric overtime-metric"><div class="metric-head"><span>今日加班</span><span class="metric-glyph red">＋</span></div><strong id="metric-overtime">0<span>小时</span></strong><small id="overtime-detail">达到门槛后按半小时累计</small></article>
+        </div>
+        <div class="content-grid">
+          <section class="panel event-panel"><div class="panel-heading"><div><h3>事件记录</h3><p>按 Windows 当前用户筛选</p></div><span id="event-count" class="count-badge">0 条</span></div><div id="event-list" class="event-list"></div></section>
+          <section class="panel edit-panel"><div class="panel-heading"><div><h3>当日记录</h3><p>自动计算结果可以手动修正</p></div><span id="record-status" class="status-pill status-muted">待同步</span></div>
+            <form id="record-form" class="record-form">
+              <div class="form-row"><label>上班时间<input id="edit-start" type="time"></label><label>预计下班<input id="edit-expected" type="time"></label></div>
+              <div class="form-row"><label>实际下班<input id="edit-end" type="time"></label><label>加班时长（小时）<input id="edit-overtime" type="number" min="0" step="0.5"></label></div>
+              <label>备注<input id="edit-note" type="text" placeholder="异常说明或手动调整原因"></label>
+              <div class="form-footer"><span id="source-note">数据来源：系统事件 / 规则计算</span><button class="button primary" type="submit">保存修改</button></div>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <section id="view-calendar" class="view">
+        <div class="calendar-layout"><section class="panel calendar-panel"><div class="calendar-toolbar"><div><h2 id="calendar-month-label"></h2><p>选择日期查看或修改考勤</p></div><div class="month-controls"><button class="icon-button" id="month-prev" title="上个月">‹</button><button class="icon-button" id="month-next" title="下个月">›</button></div></div><div class="weekday-row"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div><div id="month-grid" class="month-grid"></div></section>
+        <aside class="panel month-summary"><h3>本月摘要</h3><div class="summary-line"><span>已记录加班</span><strong id="month-overtime">0 小时</strong></div><div class="summary-line"><span>异常日期</span><strong id="month-anomalies">0 天</strong></div><div class="summary-line"><span>已记录工作日</span><strong id="month-workdays">0 天</strong></div><div class="calendar-legend"><span><i class="legend-work"></i>工作日</span><span><i class="legend-rest"></i>休息日</span><span><i class="legend-holiday"></i>法定休假</span><span><i class="legend-makeup"></i>法定补班</span><span><i class="legend-company"></i>公司上班日</span><span><i class="legend-alert"></i>异常</span></div><div class="calendar-actions"><button id="sync-month-events" class="button secondary full-width">同步本月事件</button><label class="company-day-label" for="company-workday-date">公司周六上班日</label><input id="company-workday-date" type="date"><button id="set-company-workday" class="button secondary full-width">设为本月公司上班日</button><button id="calendar-sync" class="button secondary full-width">同步法定节假日</button></div></aside></div>
+      </section>
+
+      <section id="view-stats" class="view"><div class="stats-toolbar"><div><h2>月度统计</h2><p>统计按加班开始日期归属</p></div><button id="export-csv" class="button secondary"><span class="button-icon">↓</span>导出 CSV</button></div><div class="stats-cards"><article class="stat-card"><span>本月加班</span><strong id="stats-hours">0 小时</strong><small id="stats-days">0 个加班日</small></article><article class="stat-card"><span>异常记录</span><strong id="stats-anomalies">0 天</strong><small>需要人工核对</small></article><article class="stat-card"><span>人工修改</span><strong id="stats-manual">0 天</strong><small>保留修改状态</small></article></div><section class="panel table-panel"><table><thead><tr><th>日期</th><th>类型</th><th>上班</th><th>预计下班</th><th>实际下班</th><th>加班</th><th>状态</th></tr></thead><tbody id="stats-table"></tbody></table></section></section>
+
+      <section id="view-settings" class="view"><div class="settings-layout"><section class="panel settings-panel"><div class="panel-heading"><div><h3>应用设置</h3><p>后台运行与系统集成</p></div></div><label class="setting-row"><div><strong>开机时自动启动</strong><small>登录 Windows 后在后台运行</small></div><input id="autostart" type="checkbox" class="switch"></label><div class="setting-row readonly"><div><strong>数据存储位置</strong><small id="data-path">读取中…</small></div></div><div class="setting-row readonly"><div><strong>系统事件来源</strong><small>Windows Winlogon 会话日志（普通用户可读取）</small></div></div><div class="setting-row readonly"><div><strong>异常截止时间</strong><small>次日 02:00，之后事件不计入前一日</small></div></div></section>
+        <section class="panel settings-panel"><div class="panel-heading"><div><h3>工作日日历</h3><p>调休补班数据按年度缓存，人工日期优先</p></div></div><div class="calendar-info"><strong id="calendar-status">尚无同步信息</strong><small id="calendar-years"></small></div><div class="settings-actions"><button id="calendar-sync-settings" class="button secondary">同步今年日历</button><button id="backup-export" class="button secondary">导出备份</button><label class="button secondary file-button">导入备份<input type="file" id="backup-import" accept="application/json,.json" hidden></label></div><p class="help-text">节假日数据使用 timor.tech 年度日历接口；失败时保留已缓存数据，可继续手动设置日期。</p></section></div></section>
+    </main>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>
+
