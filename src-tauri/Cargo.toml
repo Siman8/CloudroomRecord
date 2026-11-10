@@ -1,6 +1,6 @@
 [package]
 name = "mycardrecord"
-version = "1.0.1"
+version = "1.0.2"
 description = "本地考勤与加班记录"
 authors = ["Siman"]
 edition = "2021"
