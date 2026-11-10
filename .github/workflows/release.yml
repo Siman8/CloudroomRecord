@@ -1,0 +1,80 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Check whether the app version changed
+        id: version
+        shell: pwsh
+        run: |
+          $current = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $previous = $null
+          if ('${{ github.event.before }}' -match '^[0-9a-f]{40}$') {
+            $previousJson = git show '${{ github.event.before }}:src-tauri/tauri.conf.json' 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $previous = ($previousJson -join "`n" | ConvertFrom-Json).version
+            }
+          }
+
+          if ($current -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Invalid application version: $current"
+          }
+
+          if ($current -eq $previous) {
+            "changed=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Version unchanged ($current); skipping release."
+          } else {
+            "changed=true" >> $env:GITHUB_OUTPUT
+            "version=$current" >> $env:GITHUB_OUTPUT
+            Write-Host "Version changed from '$previous' to '$current'."
+          }
+
+      - name: Install frontend dependencies
+        if: steps.version.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Build Windows NSIS installer
+        if: steps.version.outputs.changed == 'true'
+        run: npm run build
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: pwsh
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | Select-Object -First 1
+          if (-not $installer) {
+            throw 'The NSIS installer was not produced.'
+          }
+
+          gh release create $tag $installer.FullName `
+            --title "考勤记录 $tag" `
+            --generate-notes
