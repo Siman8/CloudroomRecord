@@ -7,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.5';
+const APP_VERSION = '1.0.6';
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 const today = new Date();

@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "mycardrecord"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "chrono",
  "rusqlite",
