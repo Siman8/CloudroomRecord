@@ -44,6 +44,17 @@
 .intro-copy{clear:both}
 .intro-copy p{margin:0 0 12px;color:#53645c;font-size:12px;line-height:1.75}
 .intro-copy .intro-privacy{padding-top:8px;border-top:1px solid #edf1ee;color:#76837c;font-size:11px}
+.startup-reminder{margin:17px 0 13px;padding:15px 17px;border:1px solid #efc877;border-left:5px solid #d68a21;border-radius:6px;background:#fff8e8;color:#604415}
+.startup-reminder strong{display:block;margin-bottom:8px;font-size:14px;color:#754b0b}
+.startup-reminder ol{margin:0;padding-left:20px}
+.startup-reminder li{padding:3px 0;font-size:12px;font-weight:600;line-height:1.6}
+.startup-reminder>span{display:block;margin-top:7px;font-size:11px;color:#856b43}
 .intro-footer{display:flex;align-items:center;justify-content:space-between;margin-top:21px;padding-top:16px;border-top:1px solid #edf1ee}
 .intro-footer>span{color:#78857e;font-size:11px}
+.sidebar-bottom{justify-content:space-between;color:#77837d}
+.version-action{padding:0;border:0;background:none;color:#247b5c;font:600 11px inherit;cursor:pointer}
+.version-action:hover{text-decoration:underline}
+.update-panel{width:min(600px,100%)}
+.update-status{margin:0 0 14px;color:#46564d;font-size:13px;line-height:1.6}
+.update-notes{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:12px;border:1px solid #e6ece8;border-radius:5px;background:#f8faf9;color:#526159;font:12px/1.6 "Segoe UI","Microsoft YaHei UI",sans-serif}
 @media(max-width:560px){.intro-panel{padding:22px 20px 18px}.intro-heading h2{font-size:18px}}

@@ -6,6 +6,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
+const APP_VERSION = '1.0.3';
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 const today = new Date();
@@ -39,11 +40,18 @@ function showView(name) {
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active-view'));
   $(`view-${name}`).classList.add('active-view');
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const labels = {today:['考勤工作台','今日概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','设置与数据']};
+  const labels = {today:['考勤工作台','今日概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','设置']};
   $('top-eyebrow').textContent = labels[name][0]; $('page-title').textContent = labels[name][1];
   $('top-actions').classList.toggle('hidden', name !== 'today');
   if (name === 'calendar' || name === 'stats') loadMonth();
   if (name === 'settings') loadSettings();
+}
+function focusToday() {
+  selected = isoDate(new Date());
+  $('selected-date').value = selected;
+  updateSyncAvailability();
+  showView('today');
+  loadRecord();
 }
 async function loadRecord() {
   $('selected-date').value = selected;
@@ -189,6 +197,38 @@ async function loadSettings() {
     return s;
   } catch(e) { setToast(String(e),'error'); return null; }
 }
+async function checkForUpdates(silent = false) {
+  const status = $('update-status');
+  const notes = $('update-notes');
+  const open = $('update-open');
+  if (!silent) $('update-dialog').classList.remove('hidden');
+  status.textContent = '正在连接 GitHub 检查最新版本…';
+  notes.classList.add('hidden');
+  open.classList.add('hidden');
+  try {
+    await invoke('mark_updates_checked');
+    const release = await invoke('check_for_updates');
+    if (!release.update_available) {
+      if (!silent) status.textContent = `当前版本 ${release.current_version} 已是最新版本。`;
+      return;
+    }
+    $('update-dialog').classList.remove('hidden');
+    status.textContent = `发现新版本 ${release.latest_version}（当前版本 ${release.current_version}）。`;
+    if (release.notes) {
+      notes.textContent = release.notes;
+      notes.classList.remove('hidden');
+    }
+    open.dataset.url = release.html_url;
+    open.classList.remove('hidden');
+  } catch (error) {
+    if (!silent) status.textContent = `检查失败：${String(error)}`;
+  }
+}
+async function checkForUpdatesDaily() {
+  try {
+    if (await invoke('should_check_updates')) await checkForUpdates(true);
+  } catch (_) { /* Daily checks are silent; manual checks show errors. */ }
+}
 function updateSyncAvailability() {
   const button=$('sync-now');
   const allowed=selected>=firstOpenDate;
@@ -221,13 +261,23 @@ $('intro-confirm').addEventListener('click',async()=>{
   try { await invoke('complete_intro'); $('intro-dialog').classList.add('hidden'); }
   catch (error) { setToast(String(error),'error'); }
 });
+$('check-updates').addEventListener('click',()=>checkForUpdates(false));
+$('update-close').addEventListener('click',()=>$('update-dialog').classList.add('hidden'));
+$('update-open').addEventListener('click',async()=>{
+  try { await invoke('open_release_page',{url:$('update-open').dataset.url}); }
+  catch (error) { setToast(String(error),'error'); }
+});
+window.addEventListener('tauri://focus-today',focusToday);
 window.addEventListener('DOMContentLoaded',async()=>{
   setInterval(updateLiveOvertime, 1000);
+  setInterval(checkForUpdatesDaily, 60 * 60 * 1000);
   $('selected-date').value=selected;
   $('sync-now').disabled=true;
   if (!tauriInvoke) setToast('当前是界面预览模式；数据功能需要在 Tauri 桌面窗口中运行。','error');
   await loadRecord(); await loadMonth();
   const settings=await loadSettings();
+  $('app-version').textContent=`版本 ${settings?.version||APP_VERSION}`;
   if (settings?.intro_pending) $('intro-dialog').classList.remove('hidden');
+  await checkForUpdatesDaily();
 });
 

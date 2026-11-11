@@ -10,7 +10,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::ManagerExt as AutoStartManagerExt;
 
@@ -23,6 +23,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const OVERNIGHT_CUTOFF: (u32, u32) = (2, 0);
 const OVERTIME_BOUNDARY_GRACE_MINUTES: i64 = 3;
 const EARLY_DEPARTURE_GRACE_MINUTES: i64 = 10;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_REPOSITORY: &str = "Siman8/CloudroomRecord";
 
 struct AppState {
     db: Mutex<Connection>,
@@ -889,8 +891,112 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json
         .optional()
         .map_err(|e| e.to_string())?;
     Ok(
-        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1")}),
+        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1"),"version":APP_VERSION}),
     )
+}
+
+#[tauri::command]
+fn check_for_updates() -> Result<serde_json::Value, String> {
+    let response: serde_json::Value = ureq::AgentBuilder::new()
+        .timeout_connect(StdDuration::from_secs(5))
+        .timeout_read(StdDuration::from_secs(10))
+        .build()
+        .get(&format!(
+            "https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+        ))
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "CloudroomRecord")
+        .call()
+        .map_err(|error| match error {
+            ureq::Error::Status(status, response) => {
+                format!("GitHub API 返回 HTTP {status}：{}", response.status_text())
+            }
+            other => format!("无法连接 GitHub：{other}"),
+        })?
+        .into_json()
+        .map_err(|error| format!("无法解析 GitHub Release 信息：{error}"))?;
+
+    let tag = response["tag_name"]
+        .as_str()
+        .ok_or("GitHub Release 缺少版本标签")?;
+    let latest_version = tag.strip_prefix('v').unwrap_or(tag);
+    let html_url = response["html_url"]
+        .as_str()
+        .ok_or("GitHub Release 缺少下载地址")?;
+    Ok(serde_json::json!({
+        "current_version": APP_VERSION,
+        "latest_version": latest_version,
+        "update_available": version_is_newer(latest_version, APP_VERSION),
+        "html_url": html_url,
+        "notes": response["body"].as_str().unwrap_or("")
+    }))
+}
+
+#[tauri::command]
+fn should_check_updates(state: State<'_, AppState>) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let last: Option<String> = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='update_last_check'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(last.as_deref() != Some(&Local::now().date_naive().to_string()))
+}
+
+#[tauri::command]
+fn mark_updates_checked(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute("INSERT INTO metadata(key,value) VALUES('update_last_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [Local::now().date_naive().to_string()])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let numbers = |version: &str| {
+        version
+            .split_once('-')
+            .unwrap_or((version, ""))
+            .0
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()
+    };
+    match (numbers(latest), numbers(current)) {
+        (Some(latest), Some(current)) => {
+            for (left, right) in latest.iter().zip(current.iter()) {
+                if left != right {
+                    return left > right;
+                }
+            }
+            latest.len() > current.len()
+        }
+        _ => latest != current,
+    }
+}
+
+#[tauri::command]
+fn open_release_page(url: String) -> Result<(), String> {
+    let expected_prefix = format!("https://github.com/{GITHUB_REPOSITORY}/releases");
+    if !url.starts_with(&expected_prefix) {
+        return Err("Release 地址无效".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = url;
+        Err("当前平台暂不支持打开 Release 页面".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1079,6 +1185,7 @@ fn show_main(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = window.emit("tauri://focus-today", ());
     }
 }
 
@@ -1180,6 +1287,10 @@ fn main() {
             import_backup,
             export_csv,
             get_settings,
+            check_for_updates,
+            should_check_updates,
+            mark_updates_checked,
+            open_release_page,
             complete_intro,
             set_autostart
         ]);

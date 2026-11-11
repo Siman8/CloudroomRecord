@@ -75,6 +75,20 @@ jobs:
             throw 'The NSIS installer was not produced.'
           }
 
+          $changelog = Get-Content CHANGELOG.md
+          $start = ($changelog | Select-String -Pattern "^## \[$([regex]::Escape($env:RELEASE_VERSION))\]" | Select-Object -First 1).LineNumber
+          if (-not $start) {
+            throw "CHANGELOG.md does not contain a section for $env:RELEASE_VERSION"
+          }
+          $next = ($changelog | Select-String -Pattern '^## \[' | Where-Object { $_.LineNumber -gt $start } | Select-Object -First 1).LineNumber
+          if ($next) {
+            $notes = $changelog[($start - 1)..($next - 2)]
+          } else {
+            $notes = $changelog[($start - 1)..($changelog.Count - 1)]
+          }
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $notes -join "`n" | Set-Content -Path $notesPath -Encoding utf8
+
           gh release create $tag $installer.FullName `
             --title "考勤记录 $tag" `
-            --generate-notes
+            --notes-file $notesPath
