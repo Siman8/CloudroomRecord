@@ -1,4 +1,5 @@
 const tauriInvoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+const tauriListen = window.__TAURI__?.event?.listen;
 const invoke = (command, args = {}) => {
   if (!tauriInvoke) {
     return Promise.reject(new Error('当前页面未连接到 Tauri 后端。请使用 npm run dev 启动桌面窗口，不要直接打开 ui/index.html。'));
@@ -6,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.3';
+const APP_VERSION = '1.0.4';
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 const today = new Date();
@@ -79,6 +80,7 @@ function renderRecord(r, events) {
     '进行中':'当天记录仍在进行，后续锁屏或关机时会补记下班时间',
     '待打卡':'当天尚未检测到上班事件',
     '无打卡记录':'工作日未检测到上班或启动记录，请核对并手动补录',
+    '迟到':'到岗时间超出设置的弹性范围，请核对打卡记录',
     '提前下班':'结束时间早于预计下班时间，请核对记录',
     '人工修改':'此日期包含手动修正',
     '整夜未锁':'未检测到结束锁屏或关机，已按 02:00 截止',
@@ -175,7 +177,7 @@ function renderStats() {
   $('stats-table').innerHTML=monthRecords.map(r=>`<tr><td>${r.day}</td><td>${r.day_type==='workday'?'工作日':'休息日'}</td><td>${r.start_time||'—'}</td><td>${r.expected_end||'—'}</td><td>${r.end_time||'—'}</td><td>${r.overtime_minutes?hourText(r.overtime_minutes):'—'}</td><td><span class="table-status">${r.status}</span></td></tr>`).join('');
 }
 function isAnomaly(status) {
-  return ['无打卡记录','提前下班','整夜未锁','事件不完整'].includes(status);
+  return ['无打卡记录','迟到','提前下班','整夜未锁','事件不完整'].includes(status);
 }
 async function syncRange() {
   if (selected < firstOpenDate) {
@@ -192,6 +194,11 @@ async function syncCalendar(year=new Date().getFullYear()) {
 async function loadSettings() {
   try {
     const s=await invoke('get_settings'); firstOpenDate=s.first_open_date||firstOpenDate; $('autostart').checked=s.autostart; $('data-path').textContent=s.data_path; updateSyncAvailability();
+    $('work-start').value=s.attendance.work_start;
+    $('work-end').value=s.attendance.work_end;
+    $('flexible-enabled').checked=s.attendance.flexible_enabled;
+    $('flexible-minutes').value=s.attendance.flexible_minutes;
+    $('flexible-minutes').disabled=!s.attendance.flexible_enabled;
     $('calendar-status').textContent=s.calendar.last_sync?`上次同步：${new Date(s.calendar.last_sync).toLocaleString('zh-CN')}`:'尚无同步信息';
     $('calendar-years').textContent=s.calendar.cached_years.length?`已缓存年份：${s.calendar.cached_years.join('、')}`:'尚无本地日历缓存';
     return s;
@@ -201,10 +208,14 @@ async function checkForUpdates(silent = false) {
   const status = $('update-status');
   const notes = $('update-notes');
   const open = $('update-open');
+  const install = $('update-install');
+  const progress = $('update-progress');
   if (!silent) $('update-dialog').classList.remove('hidden');
   status.textContent = '正在连接 GitHub 检查最新版本…';
   notes.classList.add('hidden');
   open.classList.add('hidden');
+  install.classList.add('hidden');
+  progress.classList.add('hidden');
   try {
     await invoke('mark_updates_checked');
     const release = await invoke('check_for_updates');
@@ -219,9 +230,31 @@ async function checkForUpdates(silent = false) {
       notes.classList.remove('hidden');
     }
     open.dataset.url = release.html_url;
+    open.dataset.downloadUrl = release.download_url;
+    open.dataset.digest = release.digest || '';
     open.classList.remove('hidden');
   } catch (error) {
     if (!silent) status.textContent = `检查失败：${String(error)}`;
+  }
+}
+async function downloadUpdate() {
+  const open = $('update-open');
+  const install = $('update-install');
+  const progress = $('update-progress');
+  const status = $('update-status');
+  open.disabled = true;
+  progress.value = 0;
+  progress.classList.remove('hidden');
+  status.textContent = '正在下载更新安装包…';
+  try {
+    const path = await invoke('download_update', {downloadUrl:open.dataset.downloadUrl, expectedDigest:open.dataset.digest || null});
+    install.dataset.path = path;
+    status.textContent = '更新已下载完成，点击“确认升级”后将关闭软件并启动安装程序。';
+    open.classList.add('hidden');
+    install.classList.remove('hidden');
+  } catch (error) {
+    status.textContent = `下载失败：${String(error)}`;
+    open.disabled = false;
   }
 }
 async function checkForUpdatesDaily() {
@@ -254,6 +287,23 @@ $('record-form').addEventListener('submit',async e=>{
   try{await invoke('save_record',{record});await loadRecord();await loadMonth();setToast('当日记录已保存');}catch(err){setToast(String(err),'error');}
 });
 $('autostart').addEventListener('change',async e=>{try{await invoke('set_autostart',{enabled:e.target.checked});setToast(e.target.checked?'已启用开机自启':'已关闭开机自启');}catch(err){e.target.checked=!e.target.checked;setToast(String(err),'error');}});
+$('flexible-enabled').addEventListener('change',e=>{$('flexible-minutes').disabled=!e.target.checked;});
+$('save-attendance-settings').addEventListener('click',async()=>{
+  const button=$('save-attendance-settings');
+  button.disabled=true;
+  try {
+    await invoke('save_attendance_settings',{
+      workStart:$('work-start').value,
+      workEnd:$('work-end').value,
+      flexibleEnabled:$('flexible-enabled').checked,
+      flexibleMinutes:Number($('flexible-minutes').value)
+    });
+    await loadRecord();
+    await loadMonth();
+    setToast('考勤时间已保存，自动记录已按新规则重算');
+  } catch(error) { setToast(String(error),'error'); }
+  finally { button.disabled=false; }
+});
 $('export-csv').addEventListener('click',async()=>{try{const csv=await invoke('export_csv',{year:viewMonth.getFullYear(),month:viewMonth.getMonth()+1});downloadFile(`考勤记录-${viewMonth.getFullYear()}-${pad(viewMonth.getMonth()+1)}.csv`,'\ufeff'+csv,'text/csv;charset=utf-8');}catch(e){setToast(String(e),'error');}});
 $('backup-export').addEventListener('click',async()=>{try{const json=await invoke('export_backup');downloadFile(`考勤备份-${isoDate(new Date())}.json`,json,'application/json;charset=utf-8');setToast('备份文件已导出');}catch(e){setToast(String(e),'error');}});
 $('backup-import').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{await invoke('import_backup',{data:await file.text()});setToast('备份已导入');await loadRecord();await loadMonth();}catch(err){setToast(String(err),'error');}finally{e.target.value='';}});
@@ -263,12 +313,21 @@ $('intro-confirm').addEventListener('click',async()=>{
 });
 $('check-updates').addEventListener('click',()=>checkForUpdates(false));
 $('update-close').addEventListener('click',()=>$('update-dialog').classList.add('hidden'));
-$('update-open').addEventListener('click',async()=>{
-  try { await invoke('open_release_page',{url:$('update-open').dataset.url}); }
+$('update-open').addEventListener('click',downloadUpdate);
+$('update-install').addEventListener('click',async()=>{
+  try { await invoke('install_update',{installerPath:$('update-install').dataset.path}); }
   catch (error) { setToast(String(error),'error'); }
 });
+function renderDownloadProgress(event){
+  const detail=event.detail||{};
+  if (detail.total>0) $('update-progress').value=Math.min(100,detail.downloaded/detail.total*100);
+  $('update-status').textContent=detail.total>0
+    ? `正在下载更新：${Math.round(detail.downloaded/detail.total*100)}%`
+    : `正在下载更新：${Math.round(detail.downloaded/1024/1024)} MB`;
+}
 window.addEventListener('tauri://focus-today',focusToday);
 window.addEventListener('DOMContentLoaded',async()=>{
+  if (tauriListen) await tauriListen('update-download-progress', renderDownloadProgress);
   setInterval(updateLiveOvertime, 1000);
   setInterval(checkForUpdatesDaily, 60 * 60 * 1000);
   $('selected-date').value=selected;

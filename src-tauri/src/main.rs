@@ -3,8 +3,15 @@
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet, fs, path::PathBuf, process::Command, sync::Mutex, thread,
+    collections::HashSet,
+    fs,
+    io::{Read, Write},
+    path::PathBuf,
+    process::Command,
+    sync::Mutex,
+    thread,
     time::Duration as StdDuration,
 };
 use tauri::{
@@ -30,6 +37,25 @@ struct AppState {
     db: Mutex<Connection>,
     notified: Mutex<HashSet<String>>,
     first_open_date: NaiveDate,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AttendanceSettings {
+    work_start: NaiveTime,
+    work_end: NaiveTime,
+    flexible_enabled: bool,
+    flexible_minutes: i64,
+}
+
+impl Default for AttendanceSettings {
+    fn default() -> Self {
+        Self {
+            work_start: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            flexible_enabled: true,
+            flexible_minutes: 30,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +136,39 @@ fn open_db(path: &PathBuf) -> Result<Connection, String> {
 
 fn parse_date(day: &str) -> Result<NaiveDate, String> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| "日期格式应为 YYYY-MM-DD".to_string())
+}
+
+fn read_attendance_settings(db: &Connection) -> Result<AttendanceSettings, String> {
+    let read = |key: &str| -> Result<Option<String>, String> {
+        db.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())
+    };
+    let defaults = AttendanceSettings::default();
+    let work_start = read("work_start")?
+        .and_then(|value| NaiveTime::parse_from_str(&value, "%H:%M").ok())
+        .unwrap_or(defaults.work_start);
+    let work_end = read("work_end")?
+        .and_then(|value| NaiveTime::parse_from_str(&value, "%H:%M").ok())
+        .unwrap_or(defaults.work_end);
+    let flexible_enabled = read("flexible_enabled")?
+        .map(|value| value == "1")
+        .unwrap_or(defaults.flexible_enabled);
+    let flexible_minutes = read("flexible_minutes")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (0..=180).contains(value))
+        .unwrap_or(defaults.flexible_minutes);
+    if work_end <= work_start {
+        return Err("下班时间必须晚于上班时间".to_string());
+    }
+    Ok(AttendanceSettings {
+        work_start,
+        work_end,
+        flexible_enabled,
+        flexible_minutes,
+    })
 }
 
 fn cutoff(day: NaiveDate) -> NaiveDateTime {
@@ -268,11 +327,12 @@ fn load_events(db: &Connection, day: NaiveDate) -> Result<Vec<RawEvent>, String>
     .collect()
 }
 
-fn calculate_day(
+fn calculate_day_with_settings(
     day: NaiveDate,
     kind: &str,
     events: &[RawEvent],
     now: NaiveDateTime,
+    settings: &AttendanceSettings,
 ) -> DailyRecord {
     let mut instants: Vec<(NaiveDateTime, &str)> = events
         .iter()
@@ -307,7 +367,22 @@ fn calculate_day(
     });
     let reached_cutoff = now >= cutoff(day);
     let workday = kind == "workday";
-    let expected = start.map(|time| time + Duration::hours(9));
+    let late_minutes = start
+        .map(|time| (time.time() - settings.work_start).num_minutes().max(0))
+        .unwrap_or(0);
+    let expected = start.map(|_| {
+        day.and_time(settings.work_end)
+            + Duration::minutes(if settings.flexible_enabled {
+                late_minutes.min(settings.flexible_minutes)
+            } else {
+                0
+            })
+    });
+    let late_outside_flex = if settings.flexible_enabled {
+        late_minutes > settings.flexible_minutes
+    } else {
+        late_minutes > 0
+    };
     let day_is_complete = day < now.date() || reached_cutoff;
     let status = if start.is_none() {
         if workday && day_is_complete {
@@ -317,14 +392,15 @@ fn calculate_day(
         } else {
             "待补录"
         }
+    } else if workday && late_outside_flex {
+        "迟到"
     } else if completed_end.is_some() {
         if workday
             && completed_end.zip(expected).is_some_and(|(end, expected)| {
-                let expected = expected.time();
-                let end = end.time();
-                end <= NaiveTime::from_hms_opt(18, 0, 0).unwrap()
+                let ended_early = end.time() <= settings.work_end
                     || (end < expected
-                        && (expected - end).num_minutes() > EARLY_DEPARTURE_GRACE_MINUTES)
+                        && (expected - end).num_minutes() > EARLY_DEPARTURE_GRACE_MINUTES);
+                ended_early
             })
         {
             "提前下班"
@@ -374,6 +450,16 @@ fn calculate_day(
     }
 }
 
+#[cfg(test)]
+fn calculate_day(
+    day: NaiveDate,
+    kind: &str,
+    events: &[RawEvent],
+    now: NaiveDateTime,
+) -> DailyRecord {
+    calculate_day_with_settings(day, kind, events, now, &AttendanceSettings::default())
+}
+
 fn recalculate_day(
     db: &Connection,
     day: NaiveDate,
@@ -405,7 +491,8 @@ fn recalculate_day(
     }
     let kind = day_type(db, day)?;
     let events = load_events(db, day)?;
-    let mut record = calculate_day(day, &kind, &events, now);
+    let settings = read_attendance_settings(db)?;
+    let mut record = calculate_day_with_settings(day, &kind, &events, now, &settings);
     (record.calendar_name, record.calendar_marker) = calendar_metadata(db, day)?;
     let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     db.execute("INSERT INTO daily_records(day,data) VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET data=excluded.data", params![record.day, json]).map_err(|e| e.to_string())?;
@@ -600,6 +687,58 @@ fn sync_month_events(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let added = persist_synced_events(&db, &events, first, last)?;
     Ok(serde_json::json!({"found": events.len(), "added": added}))
+}
+
+fn recalculate_all_automatic_records(db: &Connection) -> Result<(), String> {
+    let days = {
+        let mut statement = db
+            .prepare("SELECT day FROM daily_records WHERE json_extract(data,'$.manual') != 1")
+            .map_err(|e| e.to_string())?;
+        let days = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        days
+    };
+    for day in days {
+        recalculate_day(db, parse_date(&day)?, Local::now().naive_local())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_attendance_settings(
+    state: State<'_, AppState>,
+    work_start: String,
+    work_end: String,
+    flexible_enabled: bool,
+    flexible_minutes: i64,
+) -> Result<(), String> {
+    let start = NaiveTime::parse_from_str(&work_start, "%H:%M")
+        .map_err(|_| "上班时间格式无效".to_string())?;
+    let end = NaiveTime::parse_from_str(&work_end, "%H:%M")
+        .map_err(|_| "下班时间格式无效".to_string())?;
+    if end <= start {
+        return Err("下班时间必须晚于上班时间".to_string());
+    }
+    if !(0..=180).contains(&flexible_minutes) || flexible_minutes % 5 != 0 {
+        return Err("弹性上班时长必须是 0 到 180 之间的 5 分钟倍数".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    for (key, value) in [
+        ("work_start", work_start),
+        ("work_end", work_end),
+        (
+            "flexible_enabled",
+            if flexible_enabled { "1" } else { "0" }.to_string(),
+        ),
+        ("flexible_minutes", flexible_minutes.to_string()),
+    ] {
+        db.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])
+            .map_err(|e| e.to_string())?;
+    }
+    recalculate_all_automatic_records(&db)
 }
 
 #[tauri::command]
@@ -891,7 +1030,7 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json
         .optional()
         .map_err(|e| e.to_string())?;
     Ok(
-        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1"),"version":APP_VERSION}),
+        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1"),"version":APP_VERSION,"attendance":read_attendance_settings(&db)?}),
     )
 }
 
@@ -923,13 +1062,126 @@ fn check_for_updates() -> Result<serde_json::Value, String> {
     let html_url = response["html_url"]
         .as_str()
         .ok_or("GitHub Release 缺少下载地址")?;
+    let installer = response["assets"]
+        .as_array()
+        .and_then(|assets| {
+            assets.iter().find(|asset| {
+                asset["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("_x64-setup.exe"))
+            })
+        })
+        .ok_or("此 Release 中没有找到 Windows x64 安装包")?;
+    let download_url = installer["browser_download_url"]
+        .as_str()
+        .ok_or("Release 安装包缺少下载地址")?;
+    let asset_name = installer["name"]
+        .as_str()
+        .ok_or("Release 安装包缺少文件名")?;
     Ok(serde_json::json!({
         "current_version": APP_VERSION,
         "latest_version": latest_version,
         "update_available": version_is_newer(latest_version, APP_VERSION),
         "html_url": html_url,
+        "asset_name": asset_name,
+        "download_url": download_url,
+        "digest": installer["digest"].as_str(),
         "notes": response["body"].as_str().unwrap_or("")
     }))
+}
+
+#[tauri::command]
+fn download_update(
+    app: AppHandle,
+    download_url: String,
+    expected_digest: Option<String>,
+) -> Result<String, String> {
+    let parsed = url::Url::parse(&download_url).map_err(|_| "更新下载地址无效".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || !parsed.path().contains("/releases/download/")
+    {
+        return Err("更新下载地址不是该仓库的 Release 资产".to_string());
+    }
+
+    let response = ureq::AgentBuilder::new()
+        .timeout_connect(StdDuration::from_secs(10))
+        .timeout_read(StdDuration::from_secs(30))
+        .build()
+        .get(&download_url)
+        .set("User-Agent", "CloudroomRecord")
+        .call()
+        .map_err(|error| format!("下载更新失败：{error}"))?;
+    let total = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    const MAX_UPDATE_BYTES: u64 = 500 * 1024 * 1024;
+    if total > MAX_UPDATE_BYTES {
+        return Err("安装包超过 500 MB，已取消下载".to_string());
+    }
+
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("updates");
+    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let installer = cache.join("CloudroomRecord-update.exe");
+    let partial = cache.join("CloudroomRecord-update.exe.part");
+    let mut file = fs::File::create(&partial).map_err(|e| e.to_string())?;
+    let mut reader = response.into_reader();
+    let mut hasher = Sha256::new();
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("读取更新数据失败：{e}"))?;
+        if count == 0 {
+            break;
+        }
+        downloaded += count as u64;
+        if downloaded > MAX_UPDATE_BYTES {
+            let _ = fs::remove_file(&partial);
+            return Err("安装包超过 500 MB，已取消下载".to_string());
+        }
+        file.write_all(&buffer[..count])
+            .map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..count]);
+        let _ = app.emit(
+            "update-download-progress",
+            serde_json::json!({"downloaded": downloaded, "total": total}),
+        );
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    let actual_digest = format!("sha256:{:x}", hasher.finalize());
+    if let Some(expected) = expected_digest {
+        if expected != actual_digest {
+            let _ = fs::remove_file(&partial);
+            return Err("安装包 SHA-256 校验失败，已删除损坏文件".to_string());
+        }
+    }
+    fs::rename(&partial, &installer).map_err(|e| e.to_string())?;
+    Ok(installer.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn install_update(app: AppHandle, installer_path: String) -> Result<(), String> {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("updates");
+    let installer = PathBuf::from(installer_path);
+    if installer != cache.join("CloudroomRecord-update.exe") || !installer.is_file() {
+        return Err("找不到已下载的更新安装包".to_string());
+    }
+    Command::new(&installer)
+        .spawn()
+        .map_err(|e| format!("无法启动安装程序：{e}"))?;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1287,7 +1539,10 @@ fn main() {
             import_backup,
             export_csv,
             get_settings,
+            save_attendance_settings,
             check_for_updates,
+            download_update,
+            install_update,
             should_check_updates,
             mark_updates_checked,
             open_release_page,
@@ -1518,6 +1773,52 @@ mod tests {
             day.and_hms_opt(19, 0, 0).unwrap(),
         );
         assert_eq!(record.status, "提前下班");
+    }
+
+    #[test]
+    fn configured_schedule_keeps_early_unlock_from_advancing_expected_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T08:50:00", "unlock"),
+            event("2026-11-09T18:05:00", "lock"),
+        ];
+        let record = calculate_day(day, "workday", &events, day.and_hms_opt(19, 0, 0).unwrap());
+        assert_eq!(record.expected_end.as_deref(), Some("18:00"));
+        assert_eq!(record.status, "正常");
+    }
+
+    #[test]
+    fn flexible_arrival_within_window_delays_expected_end_by_actual_lateness() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T09:28:00", "unlock"),
+            event("2026-11-09T18:28:00", "lock"),
+        ];
+        let record = calculate_day(day, "workday", &events, day.and_hms_opt(19, 0, 0).unwrap());
+        assert_eq!(record.expected_end.as_deref(), Some("18:28"));
+        assert_eq!(record.status, "正常");
+    }
+
+    #[test]
+    fn disabled_flex_schedule_flags_lateness_beyond_grace_window() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T09:31:00", "unlock"),
+            event("2026-11-09T18:05:00", "lock"),
+        ];
+        let settings = AttendanceSettings {
+            flexible_enabled: false,
+            ..AttendanceSettings::default()
+        };
+        let record = calculate_day_with_settings(
+            day,
+            "workday",
+            &events,
+            day.and_hms_opt(19, 0, 0).unwrap(),
+            &settings,
+        );
+        assert_eq!(record.expected_end.as_deref(), Some("18:00"));
+        assert_eq!(record.status, "迟到");
     }
 
     #[test]
