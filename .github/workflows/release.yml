@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Existing release version to rebuild and re-upload
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -32,6 +38,18 @@ jobs:
         id: version
         shell: pwsh
         run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $requested = '${{ inputs.release_version }}'
+            if ($requested -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Invalid release version: $requested"
+            }
+            "changed=true" >> $env:GITHUB_OUTPUT
+            "version=$requested" >> $env:GITHUB_OUTPUT
+            "existing=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Rebuilding and re-uploading existing release v$requested."
+            exit 0
+          }
+
           $current = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $previous = $null
           if ('${{ github.event.before }}' -match '^[0-9a-f]{40}$') {
@@ -47,9 +65,11 @@ jobs:
 
           if ($current -eq $previous) {
             "changed=false" >> $env:GITHUB_OUTPUT
+            "existing=false" >> $env:GITHUB_OUTPUT
             Write-Host "Version unchanged ($current); skipping release."
           } else {
             "changed=true" >> $env:GITHUB_OUTPUT
+            "existing=false" >> $env:GITHUB_OUTPUT
             "version=$current" >> $env:GITHUB_OUTPUT
             Write-Host "Version changed from '$previous' to '$current'."
           }
@@ -74,7 +94,8 @@ jobs:
           if (-not $installer) {
             throw 'The NSIS installer was not produced.'
           }
-          $assetName = "考勤记录_$($env:RELEASE_VERSION)_x64-setup.exe"
+          $assetName = "_$($env:RELEASE_VERSION)_x64-setup.exe"
+          $assetLabel = "考勤记录_$($env:RELEASE_VERSION)_x64-setup.exe"
           $releaseInstaller = Join-Path $env:RUNNER_TEMP $assetName
           Copy-Item -LiteralPath $installer.FullName -Destination $releaseInstaller -Force
 
@@ -97,6 +118,7 @@ jobs:
             version = $env:RELEASE_VERSION
             html_url = "https://github.com/${{ github.repository }}/releases/tag/$tag"
             asset_name = $assetName
+            asset_label = $assetLabel
             download_url = "https://github.com/${{ github.repository }}/releases/download/$tag/$assetName"
             digest = "sha256:$digest"
             notes = ($notes -join "`n")
@@ -104,7 +126,13 @@ jobs:
           $manifestPath = Join-Path $env:RUNNER_TEMP "latest.json"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.UTF8Encoding]::new($false))
 
-          gh release create $tag $releaseInstaller `
-            $manifestPath `
-            --title "考勤记录 $tag" `
-            --notes-file $notesPath
+          if ('${{ steps.version.outputs.existing }}' -eq 'true') {
+            gh release upload $tag "$releaseInstaller#$assetLabel" --clobber
+            gh release upload $tag $manifestPath --clobber
+            gh release edit $tag --title "考勤记录 $tag" --notes-file $notesPath
+          } else {
+            gh release create $tag "$releaseInstaller#$assetLabel" `
+              $manifestPath `
+              --title "考勤记录 $tag" `
+              --notes-file $notesPath
+          }
