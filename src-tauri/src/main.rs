@@ -1034,50 +1034,160 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json
     )
 }
 
+#[cfg(windows)]
+fn system_proxy_for_url(url: &str) -> Result<Option<String>, String> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Networking::WinHttp::{
+            WinHttpCloseHandle, WinHttpGetIEProxyConfigForCurrentUser, WinHttpGetProxyForUrl,
+            WinHttpOpen, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_AUTOPROXY_CONFIG_URL,
+            WINHTTP_AUTOPROXY_OPTIONS, WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WINHTTP_PROXY_INFO,
+        },
+        System::Com::CoTaskMemFree,
+    };
+
+    unsafe fn take_wide(value: *mut u16) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        CoTaskMemFree(value.cast::<c_void>());
+        Some(text)
+    }
+
+    let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+    let agent: Vec<u16> = "CloudroomRecord".encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let mut user_config = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+        let has_config = WinHttpGetIEProxyConfigForCurrentUser(&mut user_config) != 0;
+        let pac_url = if has_config {
+            take_wide(user_config.lpszAutoConfigUrl)
+        } else {
+            None
+        };
+        let static_proxy = if has_config {
+            take_wide(user_config.lpszProxy)
+        } else {
+            None
+        };
+        if has_config && !user_config.lpszProxyBypass.is_null() {
+            CoTaskMemFree(user_config.lpszProxyBypass.cast::<c_void>());
+        }
+
+        let Some(pac_url) = pac_url else {
+            return Ok(static_proxy.and_then(|proxy| {
+                proxy.split(';').find_map(|entry| {
+                    let candidate = entry
+                        .split_once('=')
+                        .map(|(_, value)| value.trim())
+                        .unwrap_or(entry.trim());
+                    (!candidate.is_empty()).then(|| normalize_proxy(candidate))
+                })
+            }));
+        };
+
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err("无法初始化 Windows 系统代理解析器".into());
+        }
+        let pac_wide: Vec<u16> = pac_url.encode_utf16().chain(Some(0)).collect();
+        let mut options = WINHTTP_AUTOPROXY_OPTIONS::default();
+        options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
+        options.lpszAutoConfigUrl = pac_wide.as_ptr();
+        options.fAutoLogonIfChallenged = 1;
+        let mut info = WINHTTP_PROXY_INFO::default();
+        let ok = WinHttpGetProxyForUrl(session, url_wide.as_ptr(), &mut options, &mut info) != 0;
+        WinHttpCloseHandle(session);
+        if !ok {
+            return Err("Windows 系统代理 PAC 脚本解析失败，请检查代理配置".into());
+        }
+        let proxy = if info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY {
+            None
+        } else {
+            take_wide(info.lpszProxy).map(|value| normalize_proxy(&value))
+        };
+        if !info.lpszProxyBypass.is_null() {
+            CoTaskMemFree(info.lpszProxyBypass.cast::<c_void>());
+        }
+        Ok(proxy)
+    }
+}
+
+#[cfg(not(windows))]
+fn system_proxy_for_url(_url: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+fn normalize_proxy(proxy: &str) -> String {
+    if proxy.contains("://") {
+        proxy.to_string()
+    } else {
+        format!("http://{proxy}")
+    }
+}
+
+fn update_agent(url: &str, connect_timeout: u64, read_timeout: u64) -> Result<ureq::Agent, String> {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(StdDuration::from_secs(connect_timeout))
+        .timeout_read(StdDuration::from_secs(read_timeout));
+    if let Some(proxy) = system_proxy_for_url(url)? {
+        let proxy = ureq::Proxy::new(&proxy)
+            .map_err(|error| format!("Windows 系统代理地址无效：{error}"))?;
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build())
+}
+
 #[tauri::command]
 fn check_for_updates() -> Result<serde_json::Value, String> {
-    let response: serde_json::Value = ureq::AgentBuilder::new()
-        .timeout_connect(StdDuration::from_secs(5))
-        .timeout_read(StdDuration::from_secs(10))
-        .build()
-        .get(&format!(
-            "https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
-        ))
-        .set("Accept", "application/vnd.github+json")
+    let manifest_url =
+        format!("https://github.com/{GITHUB_REPOSITORY}/releases/latest/download/latest.json");
+    let response: serde_json::Value = update_agent(&manifest_url, 5, 10)?
+        .get(&manifest_url)
         .set("User-Agent", "CloudroomRecord")
         .call()
         .map_err(|error| match error {
             ureq::Error::Status(status, response) => {
-                format!("GitHub API 返回 HTTP {status}：{}", response.status_text())
+                format!(
+                    "无法读取 GitHub 更新清单（HTTP {status}）：{}",
+                    response.status_text()
+                )
             }
-            other => format!("无法连接 GitHub：{other}"),
+            other => format!("无法连接 GitHub 更新清单：{other}"),
         })?
         .into_json()
-        .map_err(|error| format!("无法解析 GitHub Release 信息：{error}"))?;
+        .map_err(|error| format!("无法解析 GitHub 更新清单：{error}"))?;
 
-    let tag = response["tag_name"]
-        .as_str()
-        .ok_or("GitHub Release 缺少版本标签")?;
-    let latest_version = tag.strip_prefix('v').unwrap_or(tag);
+    let latest_version = response["version"].as_str().ok_or("更新清单缺少版本号")?;
+    let latest_version = latest_version.strip_prefix('v').unwrap_or(latest_version);
     let html_url = response["html_url"]
         .as_str()
-        .ok_or("GitHub Release 缺少下载地址")?;
-    let installer = response["assets"]
-        .as_array()
-        .and_then(|assets| {
-            assets.iter().find(|asset| {
-                asset["name"]
-                    .as_str()
-                    .is_some_and(|name| name.ends_with("_x64-setup.exe"))
-            })
-        })
-        .ok_or("此 Release 中没有找到 Windows x64 安装包")?;
-    let download_url = installer["browser_download_url"]
+        .ok_or("更新清单缺少 Release 页面地址")?;
+    let download_url = response["download_url"]
         .as_str()
-        .ok_or("Release 安装包缺少下载地址")?;
-    let asset_name = installer["name"]
+        .ok_or("更新清单缺少安装包地址")?;
+    let parsed_download_url =
+        url::Url::parse(download_url).map_err(|_| "更新清单中的安装包地址无效")?;
+    let expected_prefix = format!("/{}/releases/download/", GITHUB_REPOSITORY);
+    if parsed_download_url.scheme() != "https"
+        || parsed_download_url.host_str() != Some("github.com")
+        || !parsed_download_url.path().starts_with(&expected_prefix)
+    {
+        return Err("更新清单中的安装包地址不属于本仓库".into());
+    }
+    let asset_name = response["asset_name"]
         .as_str()
-        .ok_or("Release 安装包缺少文件名")?;
+        .ok_or("更新清单缺少安装包文件名")?;
     Ok(serde_json::json!({
         "current_version": APP_VERSION,
         "latest_version": latest_version,
@@ -1085,13 +1195,25 @@ fn check_for_updates() -> Result<serde_json::Value, String> {
         "html_url": html_url,
         "asset_name": asset_name,
         "download_url": download_url,
-        "digest": installer["digest"].as_str(),
-        "notes": response["body"].as_str().unwrap_or("")
+        "digest": response["digest"].as_str(),
+        "notes": response["notes"].as_str().unwrap_or("")
     }))
 }
 
 #[tauri::command]
-fn download_update(
+async fn download_update(
+    app: AppHandle,
+    download_url: String,
+    expected_digest: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        download_update_blocking(app, download_url, expected_digest)
+    })
+    .await
+    .map_err(|error| format!("更新下载任务失败：{error}"))?
+}
+
+fn download_update_blocking(
     app: AppHandle,
     download_url: String,
     expected_digest: Option<String>,
@@ -1104,10 +1226,7 @@ fn download_update(
         return Err("更新下载地址不是该仓库的 Release 资产".to_string());
     }
 
-    let response = ureq::AgentBuilder::new()
-        .timeout_connect(StdDuration::from_secs(10))
-        .timeout_read(StdDuration::from_secs(30))
-        .build()
+    let response = update_agent(&download_url, 10, 30)?
         .get(&download_url)
         .set("User-Agent", "CloudroomRecord")
         .call()
@@ -1134,12 +1253,23 @@ fn download_update(
     let mut hasher = Sha256::new();
     let mut downloaded = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
+    let started = std::time::Instant::now();
+    let mut signature = [0_u8; 2];
     loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|e| format!("读取更新数据失败：{e}"))?;
+        let count = reader.read(&mut buffer).map_err(|e| {
+            let _ = fs::remove_file(&partial);
+            format!("读取更新数据失败或超时：{e}")
+        })?;
         if count == 0 {
             break;
+        }
+        if started.elapsed() > StdDuration::from_secs(5 * 60) {
+            let _ = fs::remove_file(&partial);
+            return Err("更新下载超过 5 分钟，已取消下载".to_string());
+        }
+        let signature_len = signature.len();
+        if downloaded == 0 && count >= signature_len {
+            signature.copy_from_slice(&buffer[..signature_len]);
         }
         downloaded += count as u64;
         if downloaded > MAX_UPDATE_BYTES {
@@ -1153,6 +1283,10 @@ fn download_update(
             "update-download-progress",
             serde_json::json!({"downloaded": downloaded, "total": total}),
         );
+    }
+    if downloaded < 2 || signature != *b"MZ" {
+        let _ = fs::remove_file(&partial);
+        return Err("下载内容不是有效的 Windows 安装程序".to_string());
     }
     file.sync_all().map_err(|e| e.to_string())?;
     let actual_digest = format!("sha256:{:x}", hasher.finalize());

@@ -1,6 +1,6 @@
 [package]
 name = "mycardrecord"
-version = "1.0.4"
+version = "1.0.5"
 description = "本地考勤与加班记录"
 authors = ["Siman"]
 edition = "2021"
@@ -20,6 +20,9 @@ tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 ureq = { version = "2", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_System_Com"] }
 
 [features]
 default = ["custom-protocol"]

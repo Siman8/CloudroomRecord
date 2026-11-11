@@ -89,6 +89,19 @@ jobs:
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           $notes -join "`n" | Set-Content -Path $notesPath -Encoding utf8
 
+          $digest = (Get-FileHash -Path $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = @{
+            version = $env:RELEASE_VERSION
+            html_url = "https://github.com/${{ github.repository }}/releases/tag/$tag"
+            asset_name = $installer.Name
+            download_url = "https://github.com/${{ github.repository }}/releases/download/$tag/$([uri]::EscapeDataString($installer.Name))"
+            digest = "sha256:$digest"
+            notes = ($notes -join "`n")
+          } | ConvertTo-Json -Depth 4
+          $manifestPath = Join-Path $env:RUNNER_TEMP "latest.json"
+          [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.UTF8Encoding]::new($false))
+
           gh release create $tag $installer.FullName `
+            $manifestPath `
             --title "考勤记录 $tag" `
             --notes-file $notesPath

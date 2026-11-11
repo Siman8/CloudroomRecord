@@ -7,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.4';
+const APP_VERSION = '1.0.5';
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 const today = new Date();
@@ -41,7 +41,7 @@ function showView(name) {
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active-view'));
   $(`view-${name}`).classList.add('active-view');
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const labels = {today:['考勤工作台','今日概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','设置']};
+  const labels = {today:['考勤工作台','今日概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','应用设置']};
   $('top-eyebrow').textContent = labels[name][0]; $('page-title').textContent = labels[name][1];
   $('top-actions').classList.toggle('hidden', name !== 'today');
   if (name === 'calendar' || name === 'stats') loadMonth();
@@ -209,12 +209,14 @@ async function checkForUpdates(silent = false) {
   const notes = $('update-notes');
   const open = $('update-open');
   const install = $('update-install');
+  const fallback = $('update-fallback');
   const progress = $('update-progress');
   if (!silent) $('update-dialog').classList.remove('hidden');
   status.textContent = '正在连接 GitHub 检查最新版本…';
   notes.classList.add('hidden');
   open.classList.add('hidden');
   install.classList.add('hidden');
+  fallback.classList.add('hidden');
   progress.classList.add('hidden');
   try {
     await invoke('mark_updates_checked');
@@ -230,6 +232,7 @@ async function checkForUpdates(silent = false) {
       notes.classList.remove('hidden');
     }
     open.dataset.url = release.html_url;
+    fallback.dataset.url = release.html_url;
     open.dataset.downloadUrl = release.download_url;
     open.dataset.digest = release.digest || '';
     open.classList.remove('hidden');
@@ -240,12 +243,15 @@ async function checkForUpdates(silent = false) {
 async function downloadUpdate() {
   const open = $('update-open');
   const install = $('update-install');
+  const fallback = $('update-fallback');
   const progress = $('update-progress');
   const status = $('update-status');
   open.disabled = true;
+  fallback.classList.add('hidden');
   progress.value = 0;
   progress.classList.remove('hidden');
   status.textContent = '正在下载更新安装包…';
+  open.textContent = '正在下载…';
   try {
     const path = await invoke('download_update', {downloadUrl:open.dataset.downloadUrl, expectedDigest:open.dataset.digest || null});
     install.dataset.path = path;
@@ -255,6 +261,8 @@ async function downloadUpdate() {
   } catch (error) {
     status.textContent = `下载失败：${String(error)}`;
     open.disabled = false;
+    open.textContent = '重新下载';
+    fallback.classList.remove('hidden');
   }
 }
 async function checkForUpdatesDaily() {
@@ -314,16 +322,25 @@ $('intro-confirm').addEventListener('click',async()=>{
 $('check-updates').addEventListener('click',()=>checkForUpdates(false));
 $('update-close').addEventListener('click',()=>$('update-dialog').classList.add('hidden'));
 $('update-open').addEventListener('click',downloadUpdate);
+$('update-fallback').addEventListener('click',async()=>{
+  try { await invoke('open_release_page',{url:$('update-fallback').dataset.url}); }
+  catch (error) { $('update-status').textContent=`无法打开 GitHub 页面：${String(error)}`; }
+});
 $('update-install').addEventListener('click',async()=>{
   try { await invoke('install_update',{installerPath:$('update-install').dataset.path}); }
   catch (error) { setToast(String(error),'error'); }
 });
 function renderDownloadProgress(event){
-  const detail=event.detail||{};
-  if (detail.total>0) $('update-progress').value=Math.min(100,detail.downloaded/detail.total*100);
-  $('update-status').textContent=detail.total>0
-    ? `正在下载更新：${Math.round(detail.downloaded/detail.total*100)}%`
-    : `正在下载更新：${Math.round(detail.downloaded/1024/1024)} MB`;
+  const payload=event?.payload??event?.detail??event??{};
+  const downloaded=Number.isFinite(Number(payload.downloaded))?Math.max(0,Number(payload.downloaded)):0;
+  const total=Number.isFinite(Number(payload.total))?Math.max(0,Number(payload.total)):0;
+  if (total>0) {
+    $('update-progress').value=Math.min(100,downloaded/total*100);
+    $('update-status').textContent=`正在下载更新：${Math.round(downloaded/total*100)}%（${(downloaded/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB）`;
+  } else {
+    $('update-progress').value=0;
+    $('update-status').textContent=`正在下载更新：${(downloaded/1048576).toFixed(1)} MB`;
+  }
 }
 window.addEventListener('tauri://focus-today',focusToday);
 window.addEventListener('DOMContentLoaded',async()=>{
