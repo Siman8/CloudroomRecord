@@ -38,8 +38,8 @@
           <section class="panel event-panel"><div class="panel-heading"><div><h3>事件记录</h3><p>按 Windows 当前用户筛选</p></div><span id="event-count" class="count-badge">0 条</span></div><div id="event-list" class="event-list"></div></section>
           <section class="panel edit-panel"><div class="panel-heading"><div><h3>当日记录</h3><p>自动计算结果可以手动修正</p></div><span id="record-status" class="status-pill status-muted">待同步</span></div>
             <form id="record-form" class="record-form">
-              <div class="form-row"><label>上班时间<input id="edit-start" type="time"></label><label>预计下班<input id="edit-expected" type="time"></label></div>
-              <div class="form-row"><label>实际下班<input id="edit-end" type="time"></label><label>加班时长（小时）<input id="edit-overtime" type="number" min="0" step="0.5"></label></div>
+              <div class="form-row"><label>上班时间<input id="edit-start" type="time"></label><label>实际下班<input id="edit-end" type="time"></label></div>
+              <label>加班时长（小时）<input id="edit-overtime" type="number" min="0" step="0.5"></label>
               <label>备注<input id="edit-note" type="text" placeholder="异常说明或手动调整原因"></label>
               <div class="form-footer"><span id="source-note">数据来源：系统事件 / 规则计算</span><button class="button primary" type="submit">保存修改</button></div>
             </form>

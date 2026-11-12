@@ -87,7 +87,7 @@ function renderRecord(r, events) {
   $('banner-subtitle').textContent = subtitles[r.status] || '记录存在缺失，可同步事件或手动补充';
   $('record-status').textContent = r.status; $('record-status').className = `status-pill ${statusClass(r.status)}`;
   $('day-type').value = r.manual ? r.day_type : (r.day_type || 'workday');
-  $('edit-start').value = r.start_time || ''; $('edit-expected').value = r.expected_end || ''; $('edit-end').value = r.end_time || '';
+  $('edit-start').value = r.start_time || ''; $('edit-end').value = r.end_time || '';
   $('edit-overtime').value = (r.overtime_minutes / 60) || 0; $('edit-note').value = r.note || '';
   $('source-note').textContent = r.manual ? '数据来源：人工修改' : '数据来源：系统事件 / 规则计算';
   $('event-count').textContent = `${events.length} 条`;
@@ -272,7 +272,7 @@ $('month-next').addEventListener('click',()=>{viewMonth.setMonth(viewMonth.getMo
 $('set-company-workday').addEventListener('click',setCompanyWorkday);
 $('day-type').addEventListener('change',async e=>{try{await invoke('set_day_type',{day:selected,dayType:e.target.value});await loadRecord();await loadMonth();setToast('日期类型已更新');}catch(err){setToast(String(err),'error');}});
 $('record-form').addEventListener('submit',async e=>{
-  e.preventDefault(); const overtimeHours=Number($('edit-overtime').value||0); const record={...(currentRecord||{}),day:selected,day_type:$('day-type').value==='auto'?(currentRecord?.day_type||'workday'):$('day-type').value,start_time:$('edit-start').value||null,expected_end:$('edit-expected').value||null,end_time:$('edit-end').value||null,overtime_minutes:Math.round(overtimeHours*2)*30,status:'人工修改',manual:true,note:$('edit-note').value};
+  e.preventDefault(); const overtimeHours=Number($('edit-overtime').value||0); const record={...(currentRecord||{}),day:selected,day_type:$('day-type').value==='auto'?(currentRecord?.day_type||'workday'):$('day-type').value,start_time:$('edit-start').value||null,end_time:$('edit-end').value||null,overtime_minutes:Math.round(overtimeHours*2)*30,status:'人工修改',manual:true,note:$('edit-note').value};
   try{await invoke('save_record',{record});await loadRecord();await loadMonth();setToast('当日记录已保存');}catch(err){setToast(String(err),'error');}
 });
 $('autostart').addEventListener('change',async e=>{try{await invoke('set_autostart',{enabled:e.target.checked});setToast(e.target.checked?'已启用开机自启':'已关闭开机自启');}catch(err){e.target.checked=!e.target.checked;setToast(String(err),'error');}});
