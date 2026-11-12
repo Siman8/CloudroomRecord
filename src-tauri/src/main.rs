@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::Command,
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     thread,
     time::Duration as StdDuration,
 };
@@ -45,6 +45,8 @@ struct AttendanceSettings {
     work_end: NaiveTime,
     flexible_enabled: bool,
     flexible_minutes: i64,
+    notify_at_end: bool,
+    notify_first_unlock: bool,
 }
 
 impl Default for AttendanceSettings {
@@ -54,6 +56,8 @@ impl Default for AttendanceSettings {
             work_end: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
             flexible_enabled: true,
             flexible_minutes: 30,
+            notify_at_end: true,
+            notify_first_unlock: true,
         }
     }
 }
@@ -103,17 +107,6 @@ struct CalendarApiDay {
     date: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BackupFile {
-    schema_version: u32,
-    exported_at: String,
-    records: Vec<DailyRecord>,
-    events: Vec<RawEvent>,
-    calendar: Vec<(String, String, String, bool)>,
-    #[serde(default)]
-    company_workdays: Vec<(String, String)>,
-}
-
 fn data_file(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -138,6 +131,13 @@ fn parse_date(day: &str) -> Result<NaiveDate, String> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|_| "日期格式应为 YYYY-MM-DD".to_string())
 }
 
+fn parse_clock_time(value: &str) -> Result<NaiveTime, String> {
+    let value = value.trim();
+    NaiveTime::parse_from_str(value, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M"))
+        .map_err(|_| format!("时间格式无效：收到“{value}”，应为 HH:MM"))
+}
+
 fn read_attendance_settings(db: &Connection) -> Result<AttendanceSettings, String> {
     let read = |key: &str| -> Result<Option<String>, String> {
         db.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
@@ -160,6 +160,12 @@ fn read_attendance_settings(db: &Connection) -> Result<AttendanceSettings, Strin
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| (0..=180).contains(value))
         .unwrap_or(defaults.flexible_minutes);
+    let notify_at_end = read("notify_at_end")?
+        .map(|value| value == "1")
+        .unwrap_or(defaults.notify_at_end);
+    let notify_first_unlock = read("notify_first_unlock")?
+        .map(|value| value == "1")
+        .unwrap_or(defaults.notify_first_unlock);
     if work_end <= work_start {
         return Err("下班时间必须晚于上班时间".to_string());
     }
@@ -168,6 +174,8 @@ fn read_attendance_settings(db: &Connection) -> Result<AttendanceSettings, Strin
         work_end,
         flexible_enabled,
         flexible_minutes,
+        notify_at_end,
+        notify_first_unlock,
     })
 }
 
@@ -534,7 +542,11 @@ fn get_month(
 }
 
 #[tauri::command]
-fn save_record(state: State<'_, AppState>, mut record: DailyRecord) -> Result<(), String> {
+fn save_record(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mut record: DailyRecord,
+) -> Result<(), String> {
     parse_date(&record.day)?;
     if !["workday", "restday"].contains(&record.day_type.as_str()) {
         return Err("日期类型无效".into());
@@ -549,11 +561,13 @@ fn save_record(state: State<'_, AppState>, mut record: DailyRecord) -> Result<()
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.execute("INSERT INTO daily_records(day,data) VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET data=excluded.data", params![record.day, json]).map_err(|e| e.to_string())?;
     db.execute("INSERT INTO calendar_days(day,day_type,name,manual) VALUES(?1,?2,'手动设置',1) ON CONFLICT(day) DO UPDATE SET day_type=excluded.day_type,name='手动设置',manual=1", params![record.day, record.day_type]).map_err(|e| e.to_string())?;
+    wake_notification_scheduler(&app);
     Ok(())
 }
 
 #[tauri::command]
 fn set_day_type(
+    app: AppHandle,
     state: State<'_, AppState>,
     day: String,
     selected_type: String,
@@ -578,99 +592,439 @@ fn set_day_type(
         params![day, effective],
     )
     .map_err(|e| e.to_string())?;
+    wake_notification_scheduler(&app);
     Ok(())
 }
 
+#[cfg(windows)]
 fn query_windows_events(start: NaiveDate, end: NaiveDate) -> Result<Vec<RawEvent>, String> {
-    let start_stamp = start.format("%Y-%m-%dT00:00:00").to_string();
-    let end_stamp = end
-        .succ_opt()
-        .unwrap_or(end)
-        .format("%Y-%m-%dT02:00:00")
-        .to_string();
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-[Console]::OutputEncoding = $utf8
-$OutputEncoding = $utf8
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$from = [datetime]::Parse('{start_stamp}')
-$to = [datetime]::Parse('{end_stamp}')
-$items = @(Get-WinEvent -FilterHashtable @{{LogName='Microsoft-Windows-Winlogon/Operational'; Id=811; StartTime=$from; EndTime=$to}} -ErrorAction SilentlyContinue | ForEach-Object {{
-  $xml = [xml]$_.ToXml()
-  $eventCode = ($xml.Event.EventData.Data | Where-Object {{ $_.Name -eq 'Event' }}).'#text'
-  $subscriber = ($xml.Event.EventData.Data | Where-Object {{ $_.Name -eq 'SubscriberName' }}).'#text'
-  $eventSid = $xml.Event.System.Security.UserID
-  if ($eventSid -eq $sid -and $subscriber -eq 'TermSrv' -and ($eventCode -eq '4' -or $eventCode -eq '5')) {{
-    [pscustomobject]@{{ timestamp=$_.TimeCreated.ToString('o'); kind=$(if ($eventCode -eq '5') {{'unlock'}} else {{'lock'}}); source='windows-winlogon-log'; event_id=$_.RecordId }}
-  }}
-}})
-$items += @(Get-WinEvent -FilterHashtable @{{LogName='System'; Id=1074,6005,6006,12,13; StartTime=$from; EndTime=$to}} -ErrorAction SilentlyContinue | ForEach-Object {{
-  $kind = $null
-  if ($_.Id -eq 1074 -or $_.Id -eq 6006 -or ($_.Id -eq 13 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General')) {{ $kind = 'shutdown' }}
-  elseif ($_.Id -eq 6005 -or ($_.Id -eq 12 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General')) {{ $kind = 'startup' }}
-  if ($kind) {{ [pscustomobject]@{{ timestamp=$_.TimeCreated.ToString('o'); kind=$kind; source='windows-system-log'; event_id=$_.RecordId }} }}
-}})
-ConvertTo-Json -InputObject @($items) -Compress
-"#
-    );
-    let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        &script,
-    ]);
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
-    let output = command
-        .output()
-        .map_err(|e| format!("无法启动 PowerShell：{e}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("读取 Windows 会话事件日志失败：{error}"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("解析 Windows 事件结果失败：{e}"))?;
-    let values = value.as_array().cloned().unwrap_or_else(|| vec![value]);
-    values
-        .into_iter()
-        .map(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
-        .collect()
+    windows_events::query(start, end)
 }
 
-#[tauri::command]
-fn sync_events(
-    state: State<'_, AppState>,
-    start: String,
-    end: String,
-) -> Result<serde_json::Value, String> {
-    let first = parse_date(&start)?;
-    let last = parse_date(&end)?;
-    if last < first || (last - first).num_days() > 366 {
-        return Err("日期范围无效（最多 367 天）".into());
+#[cfg(not(windows))]
+fn query_windows_events(_start: NaiveDate, _end: NaiveDate) -> Result<Vec<RawEvent>, String> {
+    Err("读取 Windows 事件日志仅支持 Windows 系统".into())
+}
+
+#[cfg(windows)]
+mod windows_events {
+    use super::RawEvent;
+    use chrono::{Local, NaiveDate};
+    use quick_xml::{events::Event, Reader};
+    use std::{ffi::c_void, mem::size_of, ptr};
+    use windows_sys::Win32::{
+        Foundation::{
+            GetLastError, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS,
+        },
+        System::{
+            EventLog::{
+                EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection,
+                EvtRender, EvtRenderEventXml,
+            },
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+    };
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const EVT_HANDLE_BATCH: usize = 32;
+
+    struct Handle(isize);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { EvtClose(self.0) };
+            }
+        }
     }
-    if first < state.first_open_date || last < state.first_open_date {
-        return Err(format!(
-            "按日同步仅允许同步首次打开日期 {}（含）之后的数据；此前月份由首次启动的月度同步处理。",
-            state.first_open_date
-        ));
+
+    struct Token(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
     }
-    let events = query_windows_events(first, last)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let added = persist_synced_events(&db, &events, first, last)?;
-    Ok(serde_json::json!({"found": events.len(), "added": added}))
+
+    fn current_user_sid() -> Result<String, String> {
+        use windows_sys::Win32::Security::TOKEN_USER;
+        unsafe {
+            let mut token = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(format!(
+                    "无法获取当前用户身份（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let token = Token(token);
+            let mut needed = 0;
+            windows_sys::Win32::Security::GetTokenInformation(
+                token.0,
+                windows_sys::Win32::Security::TokenUser,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if needed < size_of::<TOKEN_USER>() as u32 {
+                return Err(format!(
+                    "无法读取当前用户身份（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let mut buffer = vec![0_u8; needed as usize];
+            if windows_sys::Win32::Security::GetTokenInformation(
+                token.0,
+                windows_sys::Win32::Security::TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return Err(format!(
+                    "无法读取当前用户身份（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+            let sid = user.User.Sid;
+            let mut text = ptr::null_mut();
+            if windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW(sid, &mut text)
+                == 0
+            {
+                return Err(format!(
+                    "无法解析当前用户 SID（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let mut length = 0;
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+            let value = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+            windows_sys::Win32::Foundation::LocalFree(text.cast::<c_void>());
+            Ok(value)
+        }
+    }
+
+    fn render_xml(event: isize) -> Result<String, String> {
+        unsafe {
+            let mut size = 0;
+            let mut count = 0;
+            let ok = EvtRender(
+                0,
+                event,
+                EvtRenderEventXml,
+                0,
+                ptr::null_mut(),
+                &mut size,
+                &mut count,
+            );
+            if ok != 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+                return Err(format!(
+                    "读取 Windows 事件内容失败（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let mut buffer = vec![0_u64; (size as usize + 7) / 8];
+            if EvtRender(
+                0,
+                event,
+                EvtRenderEventXml,
+                size,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                &mut count,
+            ) == 0
+            {
+                return Err(format!(
+                    "读取 Windows 事件内容失败（Windows 错误 {}）",
+                    GetLastError()
+                ));
+            }
+            let text = buffer.as_ptr().cast::<u16>();
+            let length = (0..size as usize / 2)
+                .find(|&index| *text.add(index) == 0)
+                .unwrap_or(size as usize / 2);
+            Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
+                text, length,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct EventFields {
+        event_id: u32,
+        record_id: i64,
+        timestamp: String,
+        provider: String,
+        user_sid: Option<String>,
+        data: Vec<(Option<String>, String)>,
+    }
+
+    fn read_event_fields(xml: &str) -> Result<EventFields, String> {
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+        let mut stack = Vec::<String>::new();
+        let mut event_id = None;
+        let mut record_id = None;
+        let mut timestamp = None;
+        let mut provider = None;
+        let mut user_sid = None;
+        let mut data = Vec::new();
+        let mut current_data: Option<(Option<String>, String)> = None;
+        loop {
+            match reader
+                .read_event()
+                .map_err(|e| format!("解析 Windows 事件 XML 失败：{e}"))?
+            {
+                Event::Start(tag) => {
+                    let name = String::from_utf8_lossy(tag.name().as_ref()).into_owned();
+                    if name == "Provider" {
+                        provider = tag
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"Name")
+                            .and_then(|a| a.unescape_value().ok())
+                            .map(|v| v.into_owned());
+                    }
+                    if name == "Data" {
+                        let attr = tag
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"Name")
+                            .and_then(|a| a.unescape_value().ok())
+                            .map(|v| v.into_owned());
+                        current_data = Some((attr, String::new()));
+                    }
+                    stack.push(name);
+                }
+                Event::Empty(tag) => {
+                    if tag.name().as_ref() == b"TimeCreated" {
+                        timestamp = tag
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"SystemTime")
+                            .and_then(|a| a.unescape_value().ok())
+                            .map(|v| v.into_owned());
+                    } else if tag.name().as_ref() == b"Provider" {
+                        provider = tag
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"Name")
+                            .and_then(|a| a.unescape_value().ok())
+                            .map(|v| v.into_owned());
+                    } else if tag.name().as_ref() == b"Security" {
+                        user_sid = tag
+                            .attributes()
+                            .flatten()
+                            .find(|a| a.key.as_ref() == b"UserID")
+                            .and_then(|a| a.unescape_value().ok())
+                            .map(|v| v.into_owned());
+                    }
+                }
+                Event::Text(text) => {
+                    let value = text.decode().map_err(|e| e.to_string())?.into_owned();
+                    match stack.last().map(String::as_str) {
+                        Some("EventID") => event_id = value.parse().ok(),
+                        Some("EventRecordID") => record_id = value.parse().ok(),
+                        Some("Data") => {
+                            if let Some(field) = current_data.as_mut() {
+                                field.1.push_str(&value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Event::End(tag) => {
+                    if tag.name().as_ref() == b"Data" {
+                        if let Some(field) = current_data.take() {
+                            data.push(field);
+                        }
+                    }
+                    stack.pop();
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        Ok(EventFields {
+            event_id: event_id.ok_or("事件缺少 ID")?,
+            record_id: record_id.unwrap_or_default(),
+            timestamp: timestamp.ok_or("事件缺少时间戳")?,
+            provider: provider.ok_or("事件缺少提供程序名称")?,
+            user_sid,
+            data,
+        })
+    }
+
+    fn query_channel(channel: &str, xpath: &str) -> Result<Vec<String>, String> {
+        let channel_w: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
+        let query_w: Vec<u16> = xpath.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let query = EvtQuery(
+                0,
+                channel_w.as_ptr(),
+                query_w.as_ptr(),
+                EvtQueryChannelPath | EvtQueryForwardDirection,
+            );
+            if query == 0 {
+                let error = GetLastError();
+                return Err(if error == ERROR_ACCESS_DENIED {
+                    format!("当前 Windows 用户无权读取“{channel}”事件日志，请检查该日志通道权限。")
+                } else if error == 15007 {
+                    format!("系统中不存在“{channel}”事件日志通道。")
+                } else {
+                    format!("查询“{channel}”事件日志失败（Windows 错误 {error}）。")
+                });
+            }
+            let query = Handle(query);
+            let mut output = Vec::new();
+            loop {
+                let mut events = [0_isize; EVT_HANDLE_BATCH];
+                let mut returned = 0;
+                if EvtNext(
+                    query.0,
+                    events.len() as u32,
+                    events.as_mut_ptr(),
+                    1000,
+                    0,
+                    &mut returned,
+                ) == 0
+                {
+                    let error = GetLastError();
+                    if error == ERROR_NO_MORE_ITEMS {
+                        break;
+                    }
+                    return Err(format!(
+                        "读取“{channel}”事件日志失败（Windows 错误 {error}）。"
+                    ));
+                }
+                for event in events.iter().take(returned as usize) {
+                    let event = Handle(*event);
+                    output.push(render_xml(event.0)?);
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    pub fn query(start: NaiveDate, end: NaiveDate) -> Result<Vec<RawEvent>, String> {
+        let local_start = start
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .ok_or("无法解析本地起始时间")?;
+        let local_end = end
+            .succ_opt()
+            .unwrap_or(end)
+            .and_hms_opt(2, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .latest()
+            .ok_or("无法解析本地结束时间")?;
+        let start = local_start
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = local_end
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let winlogon_query = format!(
+            "*[System[EventID=811 and TimeCreated[@SystemTime >= '{}' and @SystemTime <= '{}']]]",
+            start, end
+        );
+        let system_query = format!("*[System[(EventID=1074 or EventID=6005 or EventID=6006 or EventID=12 or EventID=13) and TimeCreated[@SystemTime >= '{}' and @SystemTime <= '{}']]]", start, end);
+        let sid = current_user_sid()?;
+        let mut records = Vec::new();
+        for xml in query_channel("Microsoft-Windows-Winlogon/Operational", &winlogon_query)? {
+            let event = read_event_fields(&xml)?;
+            let field = |key: &str| {
+                event
+                    .data
+                    .iter()
+                    .find(|(name, _)| name.as_deref() == Some(key))
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or("")
+            };
+            if event.event_id == 811
+                && event.user_sid.as_deref() == Some(sid.as_str())
+                && field("SubscriberName") == "TermSrv"
+            {
+                let kind = match field("Event") {
+                    "4" => "lock",
+                    "5" => "unlock",
+                    _ => continue,
+                };
+                records.push(RawEvent {
+                    timestamp: format_event_time(&event.timestamp)?,
+                    kind: kind.into(),
+                    source: "windows-winlogon-log".into(),
+                    event_id: Some(event.record_id),
+                });
+            }
+        }
+        for xml in query_channel("System", &system_query)? {
+            let event = read_event_fields(&xml)?;
+            let kind = if event.event_id == 1074
+                || event.event_id == 6006
+                || (event.event_id == 13 && event.provider == "Microsoft-Windows-Kernel-General")
+            {
+                "shutdown"
+            } else if event.event_id == 6005
+                || (event.event_id == 12 && event.provider == "Microsoft-Windows-Kernel-General")
+            {
+                "startup"
+            } else {
+                continue;
+            };
+            records.push(RawEvent {
+                timestamp: format_event_time(&event.timestamp)?,
+                kind: kind.into(),
+                source: "windows-system-log".into(),
+                event_id: Some(event.record_id),
+            });
+        }
+        records.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        Ok(records)
+    }
+
+    fn format_event_time(raw: &str) -> Result<String, String> {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|value| value.with_timezone(&Local).to_rfc3339())
+            .map_err(|e| format!("事件时间戳格式无效：{e}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::read_event_fields;
+
+        #[test]
+        fn parses_windows_event_xml_fields() {
+            let xml = r#"<Event><System><Provider Name="Microsoft-Windows-Winlogon"/><EventID>811</EventID><EventRecordID>42</EventRecordID><TimeCreated SystemTime="2026-11-12T09:00:00.000Z"/><Security UserID="S-1-5-21-123"/></System><EventData><Data Name="SubscriberName">TermSrv</Data><Data Name="Event">5</Data></EventData></Event>"#;
+            let event = read_event_fields(xml).unwrap();
+
+            assert_eq!(event.event_id, 811);
+            assert_eq!(event.record_id, 42);
+            assert_eq!(event.timestamp, "2026-11-12T09:00:00.000Z");
+            assert_eq!(event.provider, "Microsoft-Windows-Winlogon");
+            assert_eq!(event.user_sid.as_deref(), Some("S-1-5-21-123"));
+            assert_eq!(event.data[0].0.as_deref(), Some("SubscriberName"));
+            assert_eq!(event.data[0].1, "TermSrv");
+            assert_eq!(event.data[1].0.as_deref(), Some("Event"));
+            assert_eq!(event.data[1].1, "5");
+        }
+
+        #[test]
+        fn reports_missing_required_event_fields() {
+            let error = read_event_fields("<Event><System/></Event>").unwrap_err();
+            assert_eq!(error, "事件缺少 ID");
+        }
+    }
 }
 
 #[tauri::command]
 fn sync_month_events(
+    app: AppHandle,
     state: State<'_, AppState>,
     year: i32,
     month: u32,
@@ -686,7 +1040,8 @@ fn sync_month_events(
     let events = query_windows_events(first, last)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let added = persist_synced_events(&db, &events, first, last)?;
-    Ok(serde_json::json!({"found": events.len(), "added": added}))
+    wake_notification_scheduler(&app);
+    Ok(serde_json::json!({"synced":true,"found":events.len(),"added":added}))
 }
 
 fn recalculate_all_automatic_records(db: &Connection) -> Result<(), String> {
@@ -707,18 +1062,17 @@ fn recalculate_all_automatic_records(db: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn save_attendance_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     work_start: String,
     work_end: String,
     flexible_enabled: bool,
     flexible_minutes: i64,
 ) -> Result<(), String> {
-    let start = NaiveTime::parse_from_str(&work_start, "%H:%M")
-        .map_err(|_| "上班时间格式无效".to_string())?;
-    let end = NaiveTime::parse_from_str(&work_end, "%H:%M")
-        .map_err(|_| "下班时间格式无效".to_string())?;
+    let start = parse_clock_time(&work_start).map_err(|e| format!("上班{e}"))?;
+    let end = parse_clock_time(&work_end).map_err(|e| format!("下班{e}"))?;
     if end <= start {
         return Err("下班时间必须晚于上班时间".to_string());
     }
@@ -738,7 +1092,31 @@ fn save_attendance_settings(
         db.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])
             .map_err(|e| e.to_string())?;
     }
-    recalculate_all_automatic_records(&db)
+    recalculate_all_automatic_records(&db)?;
+    wake_notification_scheduler(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_notification_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    notify_at_end: bool,
+    notify_first_unlock: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    for (key, enabled) in [
+        ("notify_at_end", notify_at_end),
+        ("notify_first_unlock", notify_first_unlock),
+    ] {
+        db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, if enabled { "1" } else { "0" }],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    wake_notification_scheduler(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -795,25 +1173,16 @@ fn persist_synced_events(
     Ok(added)
 }
 
-#[tauri::command]
-fn sync_calendar(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    year: i32,
-) -> Result<CalendarInfo, String> {
-    if !(2020..=2035).contains(&year) {
-        return Err("日历同步年份应在 2020–2035 之间".into());
-    }
-    let response = match fetch_calendar(year) {
-        Ok(value) => value,
-        Err(error) => {
-            notify(&app, "节假日日历同步失败", &error);
-            return Err(error);
-        }
-    };
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    persist_calendar(&db, year, response)?;
-    calendar_info(&db, None)
+fn mark_month_events_synced(db: &Connection, year: i32, month: u32) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+        params![
+            format!("events_month_synced:{year:04}-{month:02}"),
+            Local::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn fetch_calendar(year: i32) -> Result<CalendarApi, String> {
@@ -834,6 +1203,9 @@ fn fetch_calendar(year: i32) -> Result<CalendarApi, String> {
 }
 
 fn persist_calendar(db: &Connection, year: i32, response: CalendarApi) -> Result<(), String> {
+    if response.holiday.is_empty() {
+        return Err(format!("{year} 年节假日日历接口未返回日期数据，未更新缓存"));
+    }
     let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
     for entry in response.holiday.values() {
         let day = entry.date.clone().ok_or("日历日期缺失")?;
@@ -879,115 +1251,96 @@ fn get_calendar_info(state: State<'_, AppState>) -> Result<CalendarInfo, String>
 }
 
 #[tauri::command]
-fn export_backup(state: State<'_, AppState>) -> Result<String, String> {
+fn export_backup(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let records = {
-        let mut stmt = db
-            .prepare("SELECT data FROM daily_records ORDER BY day")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .map(|r| {
-                serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<DailyRecord>, String>>()?;
-        rows
-    };
-    let events = {
-        let mut stmt = db
-            .prepare("SELECT data FROM raw_events ORDER BY day,event_key")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .map(|r| {
-                serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<RawEvent>, String>>()?;
-        rows
-    };
-    let calendar = {
-        let mut stmt = db
-            .prepare("SELECT day,day_type,name,manual FROM calendar_days ORDER BY day")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)? != 0,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .map(|r| r.map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, String>>()?;
-        rows
-    };
-    let company_workdays = {
-        let mut stmt = db
-            .prepare("SELECT month,day FROM company_workdays ORDER BY month")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| e.to_string())?
-            .map(|row| row.map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, String>>()?;
-        rows
-    };
-    serde_json::to_string_pretty(&BackupFile {
-        schema_version: 1,
-        exported_at: Local::now().to_rfc3339(),
-        records,
-        events,
-        calendar,
-        company_workdays,
-    })
-    .map_err(|e| e.to_string())
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "cloudroom-backup-{}-{nonce}.sqlite3",
+        std::process::id()
+    ));
+    db.backup(rusqlite::DatabaseName::Main, &path, None)
+        .map_err(|e| format!("导出数据库备份失败：{e}"))?;
+    let result = fs::read(&path).map_err(|e| format!("读取数据库备份失败：{e}"));
+    let _ = fs::remove_file(&path);
+    result
 }
 
 #[tauri::command]
-fn import_backup(state: State<'_, AppState>, data: String) -> Result<(), String> {
-    let backup: BackupFile =
-        serde_json::from_str(&data).map_err(|e| format!("备份文件无效：{e}"))?;
-    if backup.schema_version != 1 {
-        return Err("该备份文件版本不受支持".into());
+fn import_backup(data: Vec<u8>, state: State<'_, AppState>) -> Result<(), String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "cloudroom-import-{}-{nonce}.sqlite3",
+        std::process::id()
+    ));
+    fs::write(&path, data).map_err(|e| format!("读取备份文件失败：{e}"))?;
+    let backup = Connection::open(&path).map_err(|e| format!("无法打开备份文件：{e}"))?;
+    backup
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("备份文件校验失败：{e}"))
+        .and_then(|result| {
+            if result == "ok" {
+                Ok(())
+            } else {
+                Err(format!("备份文件校验失败：{result}"))
+            }
+        })?;
+    for table in [
+        "daily_records",
+        "raw_events",
+        "calendar_days",
+        "company_workdays",
+        "metadata",
+    ] {
+        backup
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |_| Ok(()),
+            )
+            .map_err(|_| format!("备份文件缺少必要数据表：{table}"))?;
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
-    for record in backup.records {
-        let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO daily_records(day,data) VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET data=excluded.data", params![record.day,json]).map_err(|e| e.to_string())?;
-    }
-    for event in backup.events {
-        let dt = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
-            .map_err(|e| e.to_string())?
-            .naive_local();
-        let day = if dt.time() <= NaiveTime::from_hms_opt(2, 0, 0).unwrap() {
-            dt.date().pred_opt().unwrap_or(dt.date())
-        } else {
-            dt.date()
-        };
-        let key = format!("backup:{}:{}", event.timestamp, event.kind);
-        let json = serde_json::to_string(&event).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT OR IGNORE INTO raw_events(event_key,day,data) VALUES(?1,?2,?3)",
-            params![key, day.to_string(), json],
+    let result = (|| {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "ATTACH DATABASE ?1 AS backupdb",
+            [path.to_string_lossy().as_ref()],
+        )
+        .map_err(|e| format!("无法读取备份数据库：{e}"))?;
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            "DELETE FROM daily_records;
+         DELETE FROM raw_events;
+         DELETE FROM calendar_days;
+         DELETE FROM company_workdays;
+         DELETE FROM metadata;",
         )
         .map_err(|e| e.to_string())?;
-    }
-    for (day, kind, name, manual) in backup.calendar {
-        tx.execute("INSERT INTO calendar_days(day,day_type,name,manual) VALUES(?1,?2,?3,?4) ON CONFLICT(day) DO UPDATE SET day_type=excluded.day_type,name=excluded.name,manual=excluded.manual",params![day,kind,name,manual as i32]).map_err(|e|e.to_string())?;
-    }
-    for (month, day) in backup.company_workdays {
-        tx.execute(
-            "INSERT INTO company_workdays(month,day) VALUES(?1,?2) ON CONFLICT(month) DO UPDATE SET day=excluded.day",
-            params![month, day],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())
+        for table in [
+            "daily_records",
+            "raw_events",
+            "calendar_days",
+            "company_workdays",
+            "metadata",
+        ] {
+            tx.execute(
+                &format!("INSERT INTO main.{table} SELECT * FROM backupdb.{table}"),
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        db.execute_batch("DETACH DATABASE backupdb")
+            .map_err(|e| e.to_string())
+    })();
+    drop(backup);
+    let _ = fs::remove_file(&path);
+    result
 }
 
 #[tauri::command]
@@ -1420,33 +1773,27 @@ fn claim_notification(db: &Connection, key: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn poll_and_notify(app: &AppHandle) {
+fn wake_notification_scheduler(app: &AppHandle) {
+    if let Some(sender) = app.try_state::<mpsc::Sender<()>>() {
+        let _ = sender.send(());
+    }
+}
+
+fn sync_calendar_if_due(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let now = Local::now().naive_local();
-    let year = now.date().year();
+    let year = Local::now().year();
     let calendar_due = state
         .db
         .lock()
         .ok()
         .and_then(|db| {
-            let last_year: Option<String> = db
+            let cached_this_year: bool = db
                 .query_row(
-                    "SELECT value FROM metadata WHERE key='calendar_last_year'",
-                    [],
+                    "SELECT EXISTS(SELECT 1 FROM calendar_days WHERE substr(day,1,4)=?1 AND manual=0)",
+                    [year.to_string()],
                     |row| row.get(0),
                 )
-                .optional()
-                .ok()
-                .flatten();
-            let last_sync: Option<String> = db
-                .query_row(
-                    "SELECT value FROM metadata WHERE key='calendar_last_sync'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .ok()
-                .flatten();
+                .ok()?;
             let last_attempt: Option<String> = db
                 .query_row(
                     "SELECT value FROM metadata WHERE key='calendar_last_attempt'",
@@ -1456,23 +1803,11 @@ fn poll_and_notify(app: &AppHandle) {
                 .optional()
                 .ok()
                 .flatten();
-            let attempted_recently = last_attempt
+            let attempted_today = last_attempt
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| {
-                    Local::now().signed_duration_since(value.with_timezone(&Local))
-                        < Duration::hours(6)
-                })
+                .map(|value| value.with_timezone(&Local).date_naive() == Local::now().date_naive())
                 .unwrap_or(false);
-            let recent = last_sync
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| {
-                    value.with_timezone(&Local).date_naive()
-                        >= Local::now().date_naive() - Duration::days(30)
-                })
-                .unwrap_or(false);
-            Some(
-                !attempted_recently && (last_year.as_deref() != Some(&year.to_string()) || !recent),
-            )
+            Some(!cached_this_year && !attempted_today)
         })
         .unwrap_or(false);
     if calendar_due {
@@ -1483,7 +1818,16 @@ fn poll_and_notify(app: &AppHandle) {
         match fetch_calendar(year) {
             Ok(calendar) => {
                 if let Ok(db) = state.db.lock() {
-                    let _ = persist_calendar(&db, year, calendar);
+                    match persist_calendar(&db, year, calendar) {
+                        Ok(()) => {
+                            let _ = app.emit("calendar-updated", ());
+                        }
+                        Err(error) => notify(
+                            app,
+                            "节假日日历未保存",
+                            &format!("{error}。已有缓存不会被覆盖。"),
+                        ),
+                    }
                 }
             }
             Err(error) => {
@@ -1500,68 +1844,205 @@ fn poll_and_notify(app: &AppHandle) {
             }
         }
     }
+}
+
+fn notification_deadline(app: &AppHandle, now: NaiveDateTime) -> Option<NaiveDateTime> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().ok()?;
+    let today = now.date();
+    let record = recalculate_day(&db, today, now).ok()?;
+    let settings = read_attendance_settings(&db).ok()?;
+    let expected_end = record
+        .expected_end
+        .as_deref()
+        .and_then(|value| NaiveTime::parse_from_str(value, "%H:%M").ok())
+        .map(|time| today.and_time(time));
+    let cutoff_day = if now.time() < NaiveTime::from_hms_opt(2, 0, 0)? {
+        today
+    } else {
+        today.succ_opt()?
+    };
+    let cutoff_at = cutoff_day.and_hms_opt(2, 0, 0)?;
+    [
+        settings
+            .notify_at_end
+            .then_some(expected_end)
+            .flatten()
+            .filter(|time| *time > now),
+        Some(cutoff_at).filter(|time| *time > now),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn poll_and_notify(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let now = Local::now().naive_local();
     let from = now.date().pred_opt().unwrap_or(now.date());
-    let to = now.date();
-    if let Ok(events) = query_windows_events(from, to) {
-        if let Ok(db) = state.db.lock() {
-            for event in events {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&event.timestamp) {
-                    let local = dt.naive_local();
-                    let day = if local.time() <= NaiveTime::from_hms_opt(2, 0, 0).unwrap() {
-                        local.date().pred_opt().unwrap_or(local.date())
-                    } else {
-                        local.date()
-                    };
-                    let key = format!(
-                        "{}:{}:{}",
-                        event.event_id.unwrap_or_default(),
-                        event.timestamp,
-                        event.kind
-                    );
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = db.execute(
-                            "INSERT OR IGNORE INTO raw_events(event_key,day,data) VALUES(?1,?2,?3)",
-                            params![key, day.to_string(), json],
+    if let Ok(db) = state.db.lock() {
+        let settings = read_attendance_settings(&db).ok();
+        for day in [from, now.date()] {
+            if let Ok(record) = recalculate_day(&db, day, now) {
+                if let Some(expected) = record
+                    .expected_end
+                    .as_deref()
+                    .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
+                    .map(|t| day.and_time(t))
+                {
+                    let key = format!("{}:end", day);
+                    if settings
+                        .as_ref()
+                        .is_some_and(|settings| settings.notify_at_end)
+                        && day == now.date()
+                        && now >= expected
+                        && now < expected + Duration::minutes(5)
+                        && claim_notification(&db, &key)
+                    {
+                        notify(
+                            app,
+                            "下班时间到了",
+                            &format!(
+                                "今天预计下班时间是 {}。",
+                                record.expected_end.unwrap_or_default()
+                            ),
+                        );
+                    }
+                }
+                if record.status == "整夜未锁" {
+                    let key = format!("{}:cutoff", day);
+                    if claim_notification(&db, &key) {
+                        notify(
+                            app,
+                            "考勤异常提醒",
+                            "截至凌晨 2:00 未检测到锁屏事件，记录已按 2:00 截止，请核对。",
                         );
                     }
                 }
             }
-            for day in [from, to] {
-                if let Ok(record) = recalculate_day(&db, day, now) {
-                    if let Some(expected) = record
-                        .expected_end
-                        .as_deref()
-                        .and_then(|t| NaiveTime::parse_from_str(t, "%H:%M").ok())
-                        .map(|t| day.and_time(t))
-                    {
-                        let key = format!("{}:end", day);
-                        if day == now.date()
-                            && now >= expected
-                            && now < expected + Duration::minutes(5)
-                            && claim_notification(&db, &key)
-                        {
-                            notify(
-                                app,
-                                "下班时间到了",
-                                &format!(
-                                    "今天预计下班时间是 {}。",
-                                    record.expected_end.unwrap_or_default()
-                                ),
-                            );
-                        }
-                    }
-                    if record.status == "整夜未锁" {
-                        let key = format!("{}:cutoff", day);
-                        if claim_notification(&db, &key) {
-                            notify(
-                                app,
-                                "考勤异常提醒",
-                                "截至凌晨 2:00 未检测到锁屏事件，记录已按 2:00 截止，请核对。",
-                            );
+        }
+    };
+}
+
+fn notify_first_unlock(app: &AppHandle, event: &RawEvent) {
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&event.timestamp) else {
+        return;
+    };
+    let local = timestamp.with_timezone(&Local);
+    let day = local.date_naive();
+    let state = app.state::<AppState>();
+    let Ok(db) = state.db.lock() else {
+        return;
+    };
+    let Ok(settings) = read_attendance_settings(&db) else {
+        return;
+    };
+    if !settings.notify_first_unlock
+        || day != Local::now().date_naive()
+        || event.kind != "unlock"
+        || day_type(&db, day).ok().as_deref() != Some("workday")
+    {
+        return;
+    }
+    let key = format!("{}:first-unlock", day);
+    if claim_notification(&db, &key) {
+        notify(
+            app,
+            "今日首次解锁已记录",
+            &format!("首次解锁时间：{}。", local.format("%H:%M:%S")),
+        );
+    }
+}
+
+fn notification_scheduler(app: AppHandle, wake: mpsc::Receiver<()>) {
+    loop {
+        let now = Local::now().naive_local();
+        poll_and_notify(&app);
+        let next = notification_deadline(&app, now)
+            .map(|deadline| (deadline - now).to_std().unwrap_or(StdDuration::ZERO))
+            .unwrap_or_else(|| StdDuration::from_secs(12 * 60 * 60));
+        match wake.recv_timeout(next) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn sync_recent_events(app: &AppHandle, allow_first_unlock_notification: bool) {
+    let now = Local::now().naive_local();
+    let from = now.date().pred_opt().unwrap_or(now.date());
+    let to = now.date();
+    match query_windows_events(from, to) {
+        Ok(events) => {
+            let state = app.state::<AppState>();
+            let mut first_unlock_to_notify = None;
+            let first_unlock = events
+                .iter()
+                .filter(|event| event.kind == "unlock")
+                .filter_map(|event| {
+                    chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                        .ok()
+                        .filter(|timestamp| timestamp.with_timezone(&Local).date_naive() == to)
+                        .map(|_| event)
+                })
+                .min_by_key(|event| event.timestamp.clone())
+                .cloned();
+            if let Ok(db) = state.db.lock() {
+                for event in events {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&event.timestamp) {
+                        let local = dt.naive_local();
+                        let day = if local.time() <= NaiveTime::from_hms_opt(2, 0, 0).unwrap() {
+                            local.date().pred_opt().unwrap_or(local.date())
+                        } else {
+                            local.date()
+                        };
+                        let key = format!(
+                            "{}:{}:{}",
+                            event.event_id.unwrap_or_default(),
+                            event.timestamp,
+                            event.kind
+                        );
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let inserted = db.execute(
+                                "INSERT OR IGNORE INTO raw_events(event_key,day,data) VALUES(?1,?2,?3)",
+                                params![key, day.to_string(), json],
+                            ).unwrap_or(0) == 1;
+                            if inserted
+                                && allow_first_unlock_notification
+                                && first_unlock.as_ref().is_some_and(|first| {
+                                    first.timestamp == event.timestamp && first.kind == event.kind
+                                })
+                            {
+                                first_unlock_to_notify = Some(event.clone());
+                            }
                         }
                     }
                 }
+                for day in [from, to] {
+                    let _ = recalculate_day(&db, day, now);
+                }
             }
+            if let Ok(mut notified) = state.notified.lock() {
+                notified.remove(&format!("windows-events-error:{}", now.date()));
+            };
+            if let Some(event) = first_unlock_to_notify {
+                notify_first_unlock(app, &event);
+            }
+            wake_notification_scheduler(app);
+            let _ = app.emit("attendance-events-updated", ());
+        }
+        Err(error) => {
+            let state = app.state::<AppState>();
+            if let Ok(mut notified) = state.notified.lock() {
+                let key = format!("windows-events-error:{}", now.date());
+                if notified.insert(key) {
+                    notify(
+                        app,
+                        "读取系统事件失败",
+                        &format!("{error}。应用不会请求管理员权限；打开对应月份时会自动重试，也可手动补录。"),
+                    );
+                }
+            };
         }
     }
 }
@@ -1647,33 +2128,89 @@ fn main() {
                 let history_handle = handle.clone();
                 thread::spawn(move || sync_initial_history(&history_handle, first_open_date));
             }
+            let (sync_sender, sync_requests) = mpsc::channel::<bool>();
+            app.manage(sync_sender);
+            let (notification_sender, notification_requests) = mpsc::channel::<()>();
+            app.manage(notification_sender);
+            let event_sync_handle = handle.clone();
+            thread::spawn(move || {
+                let _ = sync_recent_events(&event_sync_handle, false);
+                let mut foreground = false;
+                let mut next_sync = std::time::Instant::now() + StdDuration::from_secs(2 * 60 * 60);
+                loop {
+                    let timeout = next_sync.saturating_duration_since(std::time::Instant::now());
+                    match sync_requests.recv_timeout(timeout) {
+                        Ok(is_focused) => {
+                            foreground = is_focused;
+                            if foreground {
+                                let _ = sync_recent_events(&event_sync_handle, true);
+                                next_sync = std::time::Instant::now() + StdDuration::from_secs(60);
+                            } else {
+                                next_sync =
+                                    std::time::Instant::now() + StdDuration::from_secs(2 * 60 * 60);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = sync_recent_events(&event_sync_handle, true);
+                            next_sync = std::time::Instant::now()
+                                + if foreground {
+                                    StdDuration::from_secs(60)
+                                } else {
+                                    StdDuration::from_secs(2 * 60 * 60)
+                                };
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+            let notification_handle = handle.clone();
+            thread::spawn(move || {
+                notification_scheduler(notification_handle, notification_requests);
+            });
+            let calendar_handle = handle.clone();
             thread::spawn(move || loop {
-                thread::sleep(StdDuration::from_secs(60));
-                poll_and_notify(&handle);
+                sync_calendar_if_due(&calendar_handle);
+                let now = Local::now();
+                let tomorrow = now
+                    .date_naive()
+                    .succ_opt()
+                    .and_then(|day| day.and_hms_opt(0, 0, 0))
+                    .and_then(|midnight| midnight.and_local_timezone(Local).earliest())
+                    .unwrap_or_else(|| now + Duration::hours(24));
+                let wait = (tomorrow - now)
+                    .to_std()
+                    .unwrap_or(StdDuration::from_secs(60))
+                    .max(StdDuration::from_secs(60));
+                thread::sleep(wait);
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            tauri::WindowEvent::Focused(focused) => {
+                if let Some(sender) = window.app_handle().try_state::<mpsc::Sender<bool>>() {
+                    let _ = sender.send(*focused);
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             get_record,
             get_month,
             save_record,
             set_day_type,
-            sync_events,
             sync_month_events,
             set_company_workday,
-            sync_calendar,
             get_calendar_info,
             export_backup,
             import_backup,
             export_csv,
             get_settings,
             save_attendance_settings,
+            set_notification_settings,
             check_for_updates,
             download_update,
             install_update,
@@ -1703,7 +2240,13 @@ fn sync_initial_history(app: &AppHandle, first_open_date: NaiveDate) {
             Ok(events) => {
                 if let Some(state) = app.try_state::<AppState>() {
                     if let Ok(db) = state.db.lock() {
-                        let _ = persist_synced_events(&db, &events, month_start, month_end);
+                        if persist_synced_events(&db, &events, month_start, month_end).is_ok() {
+                            let _ = mark_month_events_synced(
+                                &db,
+                                month_start.year(),
+                                month_start.month(),
+                            );
+                        }
                     }
                 }
             }
@@ -1727,13 +2270,90 @@ fn sync_initial_history(app: &AppHandle, first_open_date: NaiveDate) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_html_time_values_with_or_without_seconds() {
+        assert_eq!(
+            parse_clock_time("05:00").unwrap(),
+            NaiveTime::from_hms_opt(5, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_clock_time("18:00").unwrap(),
+            NaiveTime::from_hms_opt(18, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_clock_time("18:00:00").unwrap(),
+            NaiveTime::from_hms_opt(18, 0, 0).unwrap()
+        );
+        assert!(parse_clock_time("").unwrap_err().contains("收到“”"));
+    }
+
     fn calendar_test_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
-            "CREATE TABLE calendar_days(day TEXT PRIMARY KEY, day_type TEXT NOT NULL, name TEXT NOT NULL, manual INTEGER NOT NULL DEFAULT 0); CREATE TABLE company_workdays(month TEXT PRIMARY KEY, day TEXT NOT NULL UNIQUE);",
+            "CREATE TABLE calendar_days(day TEXT PRIMARY KEY, day_type TEXT NOT NULL, name TEXT NOT NULL, manual INTEGER NOT NULL DEFAULT 0); CREATE TABLE company_workdays(month TEXT PRIMARY KEY, day TEXT NOT NULL UNIQUE); CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
         db
+    }
+
+    #[test]
+    fn notification_settings_default_on_and_persist_independently() {
+        let db = calendar_test_db();
+        let defaults = read_attendance_settings(&db).unwrap();
+        assert!(defaults.notify_at_end);
+        assert!(defaults.notify_first_unlock);
+
+        db.execute(
+            "INSERT INTO metadata(key,value) VALUES('notify_at_end','0'),('notify_first_unlock','1')",
+            [],
+        )
+        .unwrap();
+        let settings = read_attendance_settings(&db).unwrap();
+        assert!(!settings.notify_at_end);
+        assert!(settings.notify_first_unlock);
+    }
+
+    #[test]
+    fn synced_month_marker_is_idempotent_and_month_specific() {
+        let db = calendar_test_db();
+        mark_month_events_synced(&db, 2026, 11).unwrap();
+        mark_month_events_synced(&db, 2026, 11).unwrap();
+
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='events_month_synced:2026-11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let next_month: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='events_month_synced:2026-12')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!next_month);
+    }
+
+    #[test]
+    fn empty_calendar_response_is_never_cached() {
+        let db = calendar_test_db();
+        let result = persist_calendar(
+            &db,
+            2027,
+            CalendarApi {
+                code: 0,
+                holiday: std::collections::HashMap::new(),
+            },
+        );
+
+        assert!(result.is_err());
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM calendar_days", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     fn event(timestamp: &str, kind: &str) -> RawEvent {

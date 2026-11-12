@@ -65,4 +65,7 @@
 .duration-input{display:flex;align-items:center;gap:7px;color:#738078;font-size:11px}
 .duration-input input{width:76px}
 .duration-input input:disabled{background:#f2f4f3;color:#98a19c}
+.settings-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.settings-actions>.button{box-sizing:border-box;display:flex;align-items:center;justify-content:center;width:100%;height:38px;min-width:0;padding:0 12px;line-height:1}
+.settings-actions .file-button{position:relative;overflow:hidden;cursor:pointer}
 @media(max-width:560px){.intro-panel{padding:22px 20px 18px}.intro-heading h2{font-size:18px}}

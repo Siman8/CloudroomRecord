@@ -16,9 +16,9 @@ let viewMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 let monthRecords = [];
 let currentRecord = null;
 let toastTimer;
-let firstOpenDate = isoDate(today);
 let liveOvertimeExpectedEnd = null;
 let liveOvertimeBaseMinutes = 0;
+const monthSyncInFlight = new Map();
 
 function setToast(message, type = 'success') {
   const el = $('toast'); el.textContent = message; el.className = `toast show ${type}`;
@@ -50,7 +50,6 @@ function showView(name) {
 function focusToday() {
   selected = isoDate(new Date());
   $('selected-date').value = selected;
-  updateSyncAvailability();
   showView('today');
   loadRecord();
 }
@@ -119,18 +118,22 @@ async function loadMonth() {
   $('calendar-month-label').textContent = `${year} 年 ${month} 月`;
   $('company-workday-date').min = `${year}-${pad(month)}-01`;
   $('company-workday-date').max = isoDate(new Date(year, month, 0));
-  $('company-workday-date').value = `${year}-${pad(month)}-01`;
-  $('sync-month-events').disabled = false;
-  try { monthRecords = await invoke('get_month',{year,month}); renderMonth(); renderStats(); }
-  catch(e) { setToast(String(e),'error'); }
-}
-async function syncMonthEvents() {
   try {
-    const result=await invoke('sync_month_events',{year:viewMonth.getFullYear(),month:viewMonth.getMonth()+1});
-    setToast(`本月同步完成：发现 ${result.found} 条事件，新增 ${result.added} 条`);
-    await loadMonth();
-    if (selected.startsWith(`${viewMonth.getFullYear()}-${pad(viewMonth.getMonth()+1)}`)) await loadRecord();
-  } catch(e) { setToast(String(e),'error'); }
+    const key=`${year}-${pad(month)}`;
+    if (!monthSyncInFlight.has(key)) {
+      const sync=invoke('sync_month_events',{year,month})
+        .then(()=>({ok:true}))
+        .catch(error=>{setToast(`自动同步 ${key} 系统事件失败：${error}`,'error');return {ok:false};});
+      monthSyncInFlight.set(key,sync);
+    }
+    const syncResult=await monthSyncInFlight.get(key);
+    if (!syncResult.ok) monthSyncInFlight.delete(key);
+    monthRecords = await invoke('get_month',{year,month}); renderMonth(); renderStats();
+    const firstSaturday = new Date(year, month - 1, 1);
+    while (firstSaturday.getDay() !== 6) firstSaturday.setDate(firstSaturday.getDate() + 1);
+    $('company-workday-date').value = monthRecords.find(record => record.calendar_name?.includes('公司上班'))?.day || monthRecords.find(record => record.calendar_marker === '公司')?.day || isoDate(firstSaturday);
+  }
+  catch(e) { setToast(String(e),'error'); }
 }
 async function setCompanyWorkday() {
   const day=$('company-workday-date').value;
@@ -179,28 +182,16 @@ function renderStats() {
 function isAnomaly(status) {
   return ['无打卡记录','迟到','提前下班','整夜未锁','事件不完整'].includes(status);
 }
-async function syncRange() {
-  if (selected < firstOpenDate) {
-    setToast(`按日同步仅允许 ${firstOpenDate}（含）之后的日期；更早月份由首次启动的历史同步处理。`, 'error');
-    return;
-  }
-  try { const result=await invoke('sync_events',{start:selected,end:selected}); setToast(`同步完成：发现 ${result.found} 条事件，新增 ${result.added} 条`); await loadRecord(); await loadMonth(); }
-  catch(e) { setToast(String(e),'error'); }
-}
-async function syncCalendar(year=new Date().getFullYear()) {
-  try { const info=await invoke('sync_calendar',{year}); setToast(`${year} 年法定工作日/节假日日历已同步`); await loadSettings(); await loadMonth(); await loadRecord(); }
-  catch(e) { setToast(String(e),'error'); }
-}
 async function loadSettings() {
   try {
-    const s=await invoke('get_settings'); firstOpenDate=s.first_open_date||firstOpenDate; $('autostart').checked=s.autostart; $('data-path').textContent=s.data_path; updateSyncAvailability();
+    const s=await invoke('get_settings'); $('autostart').checked=s.autostart; $('data-path').textContent=s.data_path;
     $('work-start').value=s.attendance.work_start;
     $('work-end').value=s.attendance.work_end;
     $('flexible-enabled').checked=s.attendance.flexible_enabled;
     $('flexible-minutes').value=s.attendance.flexible_minutes;
     $('flexible-minutes').disabled=!s.attendance.flexible_enabled;
-    $('calendar-status').textContent=s.calendar.last_sync?`上次同步：${new Date(s.calendar.last_sync).toLocaleString('zh-CN')}`:'尚无同步信息';
-    $('calendar-years').textContent=s.calendar.cached_years.length?`已缓存年份：${s.calendar.cached_years.join('、')}`:'尚无本地日历缓存';
+    $('notify-at-end').checked=s.attendance.notify_at_end;
+    $('notify-first-unlock').checked=s.attendance.notify_first_unlock;
     return s;
   } catch(e) { setToast(String(e),'error'); return null; }
 }
@@ -270,25 +261,15 @@ async function checkForUpdatesDaily() {
     if (await invoke('should_check_updates')) await checkForUpdates(true);
   } catch (_) { /* Daily checks are silent; manual checks show errors. */ }
 }
-function updateSyncAvailability() {
-  const button=$('sync-now');
-  const allowed=selected>=firstOpenDate;
-  button.disabled=!allowed;
-  button.title=allowed?'同步所选日期的系统锁定/解锁事件':`首次打开日期为 ${firstOpenDate}，更早日期不能按日同步`;
-}
 function downloadFile(filename,content,type) {
   const blob=new Blob([content],{type}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click(); URL.revokeObjectURL(a.href);
 }
 
 document.querySelectorAll('.nav-item').forEach(el=>el.addEventListener('click',()=>showView(el.dataset.view)));
-$('selected-date').addEventListener('change',e=>{selected=e.target.value;updateSyncAvailability();loadRecord();});
-$('sync-now').addEventListener('click',syncRange);
+$('selected-date').addEventListener('change',e=>{selected=e.target.value;loadRecord();});
 $('month-prev').addEventListener('click',()=>{viewMonth.setMonth(viewMonth.getMonth()-1);loadMonth();});
 $('month-next').addEventListener('click',()=>{viewMonth.setMonth(viewMonth.getMonth()+1);loadMonth();});
-$('calendar-sync').addEventListener('click',()=>syncCalendar(viewMonth.getFullYear()));
-$('sync-month-events').addEventListener('click',syncMonthEvents);
 $('set-company-workday').addEventListener('click',setCompanyWorkday);
-$('calendar-sync-settings').addEventListener('click',()=>syncCalendar(new Date().getFullYear()));
 $('day-type').addEventListener('change',async e=>{try{await invoke('set_day_type',{day:selected,dayType:e.target.value});await loadRecord();await loadMonth();setToast('日期类型已更新');}catch(err){setToast(String(err),'error');}});
 $('record-form').addEventListener('submit',async e=>{
   e.preventDefault(); const overtimeHours=Number($('edit-overtime').value||0); const record={...(currentRecord||{}),day:selected,day_type:$('day-type').value==='auto'?(currentRecord?.day_type||'workday'):$('day-type').value,start_time:$('edit-start').value||null,expected_end:$('edit-expected').value||null,end_time:$('edit-end').value||null,overtime_minutes:Math.round(overtimeHours*2)*30,status:'人工修改',manual:true,note:$('edit-note').value};
@@ -298,11 +279,14 @@ $('autostart').addEventListener('change',async e=>{try{await invoke('set_autosta
 $('flexible-enabled').addEventListener('change',e=>{$('flexible-minutes').disabled=!e.target.checked;});
 $('save-attendance-settings').addEventListener('click',async()=>{
   const button=$('save-attendance-settings');
+  const workStart=$('work-start').value;
+  const workEnd=$('work-end').value;
+  if (!workStart || !workEnd) { setToast('请填写上班和下班时间','error'); return; }
   button.disabled=true;
   try {
     await invoke('save_attendance_settings',{
-      workStart:$('work-start').value,
-      workEnd:$('work-end').value,
+      workStart,
+      workEnd,
       flexibleEnabled:$('flexible-enabled').checked,
       flexibleMinutes:Number($('flexible-minutes').value)
     });
@@ -312,9 +296,23 @@ $('save-attendance-settings').addEventListener('click',async()=>{
   } catch(error) { setToast(String(error),'error'); }
   finally { button.disabled=false; }
 });
+$('notify-at-end').addEventListener('change',saveNotificationSettings);
+$('notify-first-unlock').addEventListener('change',saveNotificationSettings);
+async function saveNotificationSettings() {
+  try {
+    await invoke('set_notification_settings',{
+      notifyAtEnd:$('notify-at-end').checked,
+      notifyFirstUnlock:$('notify-first-unlock').checked
+    });
+    setToast('通知设置已保存');
+  } catch(error) {
+    setToast(String(error),'error');
+    await loadSettings();
+  }
+}
 $('export-csv').addEventListener('click',async()=>{try{const csv=await invoke('export_csv',{year:viewMonth.getFullYear(),month:viewMonth.getMonth()+1});downloadFile(`考勤记录-${viewMonth.getFullYear()}-${pad(viewMonth.getMonth()+1)}.csv`,'\ufeff'+csv,'text/csv;charset=utf-8');}catch(e){setToast(String(e),'error');}});
-$('backup-export').addEventListener('click',async()=>{try{const json=await invoke('export_backup');downloadFile(`考勤备份-${isoDate(new Date())}.json`,json,'application/json;charset=utf-8');setToast('备份文件已导出');}catch(e){setToast(String(e),'error');}});
-$('backup-import').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{await invoke('import_backup',{data:await file.text()});setToast('备份已导入');await loadRecord();await loadMonth();}catch(err){setToast(String(err),'error');}finally{e.target.value='';}});
+$('backup-export').addEventListener('click',async()=>{try{const bytes=await invoke('export_backup');downloadFile(`考勤记录备份-${isoDate(new Date())}.sqlite3`,new Uint8Array(bytes),'application/vnd.sqlite3');setToast('完整数据库备份已下载到系统“下载”文件夹');}catch(e){setToast(String(e),'error');}});
+$('backup-import').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{if(!confirm(`导入“${file.name}”会覆盖当前所有本机考勤数据和设置，是否继续？`))return;const bytes=Array.from(new Uint8Array(await file.arrayBuffer()));await invoke('import_backup',{data:bytes});setToast('数据库备份已导入，应用将重新载入数据');await loadSettings();await loadRecord();await loadMonth();}catch(err){setToast(String(err),'error');}finally{e.target.value='';}});
 $('intro-confirm').addEventListener('click',async()=>{
   try { await invoke('complete_intro'); $('intro-dialog').classList.add('hidden'); }
   catch (error) { setToast(String(error),'error'); }
@@ -345,13 +343,22 @@ function renderDownloadProgress(event){
 window.addEventListener('tauri://focus-today',focusToday);
 window.addEventListener('DOMContentLoaded',async()=>{
   if (tauriListen) await tauriListen('update-download-progress', renderDownloadProgress);
+  if (tauriListen) await tauriListen('calendar-updated', async()=>{
+    await loadSettings();
+    await loadMonth();
+    if (selected === isoDate(new Date())) await loadRecord();
+  });
+  if (tauriListen) await tauriListen('attendance-events-updated', async()=>{
+    await loadRecord();
+    await loadMonth();
+  });
   setInterval(updateLiveOvertime, 1000);
   setInterval(checkForUpdatesDaily, 60 * 60 * 1000);
   $('selected-date').value=selected;
-  $('sync-now').disabled=true;
   if (!tauriInvoke) setToast('当前是界面预览模式；数据功能需要在 Tauri 桌面窗口中运行。','error');
   await loadRecord(); await loadMonth();
   const settings=await loadSettings();
+  await loadMonth();
   $('app-version').textContent=`版本 ${settings?.version||APP_VERSION}`;
   if (settings?.intro_pending) $('intro-dialog').classList.remove('hidden');
   await checkForUpdatesDaily();
