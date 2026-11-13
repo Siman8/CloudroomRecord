@@ -1,4 +1,4 @@
-# 考勤记录（Rust + Tauri）
+# 考勤管理（Rust + Tauri）
 
 Windows 本地考勤与加班桌面工具。当前实现包含 Tauri 托盘窗口、本地 SQLite、每日考勤计算、Windows 安全事件同步、节假日日历缓存、手动修正、月度统计、备份/恢复和 CSV 导出。
 

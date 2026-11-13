@@ -7,18 +7,35 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.6';
+const APP_VERSION = '1.0.9';
+const THEME_MODES = new Set(['auto', 'light', 'dark']);
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
 let selected = isoDate(new Date());
 let viewMonth = (() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), 1); })();
+let statsMonth = (() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), 1); })();
 let monthRecords = [];
+let statsRecords = [];
 let currentRecord = null;
 let toastTimer;
 let liveOvertimeExpectedEnd = null;
 let liveOvertimeBaseMinutes = 0;
 const monthSyncInFlight = new Map();
 let updateCheckInFlight = null;
+let systemThemeQuery = null;
+
+function applyTheme(mode) {
+  const normalized = THEME_MODES.has(mode) ? mode : 'auto';
+  if (systemThemeQuery) systemThemeQuery.removeEventListener('change', onSystemThemeChange);
+  systemThemeQuery = normalized === 'auto' ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  document.documentElement.dataset.theme = normalized === 'auto'
+    ? (systemThemeQuery.matches ? 'dark' : 'light')
+    : normalized;
+  if (systemThemeQuery) systemThemeQuery.addEventListener('change', onSystemThemeChange);
+}
+function onSystemThemeChange() {
+  applyTheme('auto');
+}
 
 function setToast(message, type = 'success') {
   const el = $('toast'); el.textContent = message; el.className = `toast show ${type}`;
@@ -41,10 +58,11 @@ function showView(name) {
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active-view'));
   $(`view-${name}`).classList.add('active-view');
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const labels = {today:['考勤工作台','今日概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','应用设置']};
+  const labels = {today:['考勤工作台','概览'],calendar:['每日记录','月度日历'],stats:['统计分析','统计报表'],settings:['偏好设置','应用设置']};
   $('top-eyebrow').textContent = labels[name][0]; $('page-title').textContent = labels[name][1];
   $('top-actions').classList.toggle('hidden', name !== 'today');
-  if (name === 'calendar' || name === 'stats') loadMonth();
+  if (name === 'calendar') loadMonth();
+  if (name === 'stats') loadStatsMonth();
   if (name === 'settings') loadSettings();
 }
 function focusToday() {
@@ -130,12 +148,29 @@ async function loadMonth() {
     }
     const syncResult=await monthSyncInFlight.get(key);
     if (!syncResult.ok) monthSyncInFlight.delete(key);
-    monthRecords = await invoke('get_month',{year,month}); renderMonth(); renderStats();
+    monthRecords = await invoke('get_month',{year,month}); renderMonth();
     const firstSaturday = new Date(year, month - 1, 1);
     while (firstSaturday.getDay() !== 6) firstSaturday.setDate(firstSaturday.getDate() + 1);
     $('company-workday-date').value = monthRecords.find(record => record.calendar_name?.includes('公司上班'))?.day || monthRecords.find(record => record.calendar_marker === '公司')?.day || isoDate(firstSaturday);
   }
   catch(e) { setToast(String(e),'error'); }
+}
+async function loadStatsMonth() {
+  const year = statsMonth.getFullYear(), month = statsMonth.getMonth() + 1;
+  $('stats-month-label').textContent = `${year} 年 ${month} 月统计`;
+  try {
+    const key = `${year}-${pad(month)}`;
+    if (!monthSyncInFlight.has(key)) {
+      const sync = invoke('sync_month_events',{year,month})
+        .then(() => ({ok:true}))
+        .catch(error => { setToast(`自动同步 ${key} 系统事件失败：${error}`,'error'); return {ok:false}; });
+      monthSyncInFlight.set(key, sync);
+    }
+    const syncResult = await monthSyncInFlight.get(key);
+    if (!syncResult.ok) monthSyncInFlight.delete(key);
+    statsRecords = await invoke('get_month',{year,month});
+    renderStats();
+  } catch(e) { setToast(String(e),'error'); }
 }
 async function setCompanyWorkday() {
   const day=$('company-workday-date').value;
@@ -175,12 +210,12 @@ function renderMonth() {
   $('month-workdays').textContent=`${monthRecords.filter(r=>r.day_type==='workday'&&r.start_time).length} 天`;
 }
 function renderStats() {
-  const total=monthRecords.reduce((n,r)=>n+r.overtime_minutes,0);
+  const total=statsRecords.reduce((n,r)=>n+r.overtime_minutes,0);
   $('stats-hours').textContent=`${(total/60).toFixed(total%60?1:0)} 小时`;
-  $('stats-days').textContent=`${monthRecords.filter(r=>r.overtime_minutes>0).length} 个加班日`;
-  $('stats-anomalies').textContent=`${monthRecords.filter(r=>isAnomaly(r.status)).length} 天`;
-  $('stats-manual').textContent=`${monthRecords.filter(r=>r.manual).length} 天`;
-  $('stats-table').innerHTML=monthRecords.map(r=>`<tr><td>${r.day}</td><td>${r.day_type==='workday'?'工作日':'休息日'}</td><td>${r.start_time||'—'}</td><td>${r.expected_end||'—'}</td><td>${r.end_time||'—'}</td><td>${r.overtime_minutes?hourText(r.overtime_minutes):'—'}</td><td><span class="table-status">${r.status}</span></td></tr>`).join('');
+  $('stats-days').textContent=`${statsRecords.filter(r=>r.overtime_minutes>0).length} 个加班日`;
+  $('stats-anomalies').textContent=`${statsRecords.filter(r=>isAnomaly(r.status)).length} 天`;
+  $('stats-manual').textContent=`${statsRecords.filter(r=>r.manual).length} 天`;
+  $('stats-table').innerHTML=statsRecords.map(r=>`<tr><td>${r.day}</td><td>${r.day_type==='workday'?'工作日':'休息日'}</td><td>${r.start_time||'—'}</td><td>${r.expected_end||'—'}</td><td>${r.end_time||'—'}</td><td>${r.overtime_minutes?hourText(r.overtime_minutes):'—'}</td><td><span class="table-status">${r.status}</span></td></tr>`).join('');
 }
 function isAnomaly(status) {
   return ['无打卡记录','迟到','提前下班','整夜未锁','事件不完整'].includes(status);
@@ -188,6 +223,7 @@ function isAnomaly(status) {
 async function loadSettings() {
   try {
     const s=await invoke('get_settings'); $('autostart').checked=s.autostart; $('data-path').textContent=s.data_path;
+    $('theme-mode').value = s.theme || 'auto'; applyTheme($('theme-mode').value);
     $('work-start').value=s.attendance.work_start;
     $('work-end').value=s.attendance.work_end;
     $('flexible-enabled').checked=s.attendance.flexible_enabled;
@@ -290,6 +326,8 @@ document.querySelectorAll('.nav-item').forEach(el=>el.addEventListener('click',(
 $('selected-date').addEventListener('change',e=>{selected=e.target.value;loadRecord();});
 $('month-prev').addEventListener('click',()=>{viewMonth.setMonth(viewMonth.getMonth()-1);loadMonth();});
 $('month-next').addEventListener('click',()=>{viewMonth.setMonth(viewMonth.getMonth()+1);loadMonth();});
+$('stats-month-prev').addEventListener('click',()=>{statsMonth.setMonth(statsMonth.getMonth()-1);loadStatsMonth();});
+$('stats-month-next').addEventListener('click',()=>{statsMonth.setMonth(statsMonth.getMonth()+1);loadStatsMonth();});
 $('set-company-workday').addEventListener('click',setCompanyWorkday);
 $('day-type').addEventListener('change',async e=>{try{await invoke('set_day_type',{day:selected,dayType:e.target.value});await loadRecord();await loadMonth();setToast('日期类型已更新');}catch(err){setToast(String(err),'error');}});
 $('record-form').addEventListener('submit',async e=>{
@@ -297,6 +335,12 @@ $('record-form').addEventListener('submit',async e=>{
   try{await invoke('save_record',{record});await loadRecord();await loadMonth();setToast('当日记录已保存');}catch(err){setToast(String(err),'error');}
 });
 $('autostart').addEventListener('change',async e=>{try{await invoke('set_autostart',{enabled:e.target.checked});setToast(e.target.checked?'已启用开机自启':'已关闭开机自启');}catch(err){e.target.checked=!e.target.checked;setToast(String(err),'error');}});
+$('theme-mode').addEventListener('change',async e=>{
+  const mode = e.target.value;
+  applyTheme(mode);
+  try { await invoke('set_theme_mode',{mode}); }
+  catch(err) { setToast(String(err),'error'); await loadSettings(); }
+});
 $('flexible-enabled').addEventListener('change',e=>{$('flexible-minutes').disabled=!e.target.checked;});
 $('save-attendance-settings').addEventListener('click',async()=>{
   const button=$('save-attendance-settings');
@@ -331,8 +375,8 @@ async function saveNotificationSettings() {
     await loadSettings();
   }
 }
-$('export-csv').addEventListener('click',async()=>{try{const csv=await invoke('export_csv',{year:viewMonth.getFullYear(),month:viewMonth.getMonth()+1});downloadFile(`考勤记录-${viewMonth.getFullYear()}-${pad(viewMonth.getMonth()+1)}.csv`,'\ufeff'+csv,'text/csv;charset=utf-8');}catch(e){setToast(String(e),'error');}});
-$('backup-export').addEventListener('click',async()=>{try{const bytes=await invoke('export_backup');downloadFile(`考勤记录备份-${isoDate(new Date())}.sqlite3`,new Uint8Array(bytes),'application/vnd.sqlite3');setToast('完整数据库备份已下载到系统“下载”文件夹');}catch(e){setToast(String(e),'error');}});
+$('export-csv').addEventListener('click',async()=>{try{const csv=await invoke('export_csv',{year:statsMonth.getFullYear(),month:statsMonth.getMonth()+1});downloadFile(`考勤管理-${statsMonth.getFullYear()}-${pad(statsMonth.getMonth()+1)}.csv`,'\ufeff'+csv,'text/csv;charset=utf-8');}catch(e){setToast(String(e),'error');}});
+$('backup-export').addEventListener('click',async()=>{try{const bytes=await invoke('export_backup');downloadFile(`考勤管理备份-${isoDate(new Date())}.sqlite3`,new Uint8Array(bytes),'application/vnd.sqlite3');setToast('完整数据库备份已下载到系统“下载”文件夹');}catch(e){setToast(String(e),'error');}});
 $('backup-import').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{if(!confirm(`导入“${file.name}”会覆盖当前所有本机考勤数据和设置，是否继续？`))return;const bytes=Array.from(new Uint8Array(await file.arrayBuffer()));await invoke('import_backup',{data:bytes});setToast('数据库备份已导入，应用将重新载入数据');await loadSettings();await loadRecord();await loadMonth();}catch(err){setToast(String(err),'error');}finally{e.target.value='';}});
 $('intro-confirm').addEventListener('click',async()=>{
   try { await invoke('complete_intro'); $('intro-dialog').classList.add('hidden'); }

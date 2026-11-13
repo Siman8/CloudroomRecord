@@ -95,7 +95,7 @@ jobs:
             throw 'The NSIS installer was not produced.'
           }
           $assetName = "_$($env:RELEASE_VERSION)_x64-setup.exe"
-          $assetLabel = "考勤记录_$($env:RELEASE_VERSION)_x64-setup.exe"
+          $assetLabel = "考勤管理_$($env:RELEASE_VERSION)_x64-setup.exe"
           $releaseInstaller = Join-Path $env:RUNNER_TEMP $assetName
           Copy-Item -LiteralPath $installer.FullName -Destination $releaseInstaller -Force
 
@@ -129,10 +129,10 @@ jobs:
           if ('${{ steps.version.outputs.existing }}' -eq 'true') {
             gh release upload $tag "$releaseInstaller#$assetLabel" --clobber
             gh release upload $tag $manifestPath --clobber
-            gh release edit $tag --title "考勤记录 $tag" --notes-file $notesPath
+            gh release edit $tag --title "考勤管理 $tag" --notes-file $notesPath
           } else {
             gh release create $tag "$releaseInstaller#$assetLabel" `
               $manifestPath `
-              --title "考勤记录 $tag" `
+              --title "考勤管理 $tag" `
               --notes-file $notesPath
           }

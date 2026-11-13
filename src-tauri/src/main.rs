@@ -1382,9 +1382,72 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json
         )
         .optional()
         .map_err(|e| e.to_string())?;
+    let theme = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='theme_mode'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "auto".to_string());
     Ok(
-        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1"),"version":APP_VERSION,"attendance":read_attendance_settings(&db)?}),
+        serde_json::json!({"autostart":autostart,"data_path":path.to_string_lossy(),"calendar":info,"first_open_date":state.first_open_date,"intro_pending":intro_shown.as_deref()!=Some("1"),"version":APP_VERSION,"theme":theme,"attendance":read_attendance_settings(&db)?}),
     )
+}
+
+#[tauri::command]
+fn set_theme_mode(mode: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if !matches!(mode.as_str(), "auto" | "light" | "dark") {
+        return Err("主题模式无效".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute("INSERT INTO metadata(key,value) VALUES('theme_mode',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&mode])
+        .map_err(|e| e.to_string())?;
+    drop(db);
+    #[cfg(windows)]
+    if let Some(window) = app.get_webview_window("main") {
+        set_native_titlebar_theme(&window, &mode)?;
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_native_titlebar_theme(window: &tauri::WebviewWindow, mode: &str) -> Result<(), String> {
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    if mode == "auto" {
+        // Attribute 20 with a zero value clears the app override and delegates to Windows.
+        let value = 0u32;
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0 as _,
+                20,
+                (&value as *const u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if result < 0 {
+            return Err(format!("重置自动标题栏主题失败：HRESULT {result}"));
+        }
+        return Ok(());
+    }
+    let value = u32::from(mode == "dark");
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0 as _,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&value as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if result < 0 {
+        return Err(format!("设置标题栏主题失败：HRESULT {result}"));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2275,14 +2338,14 @@ fn show_main(app: &AppHandle) {
 }
 
 fn tray(app: &tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开考勤记录", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "打开考勤管理", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
-        .tooltip("考勤记录")
+        .tooltip("考勤管理")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main(app),
             "quit" => app.exit(0),
@@ -2310,7 +2373,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
-                .app_name("考勤记录")
+                .app_name("考勤管理")
                 .build(),
         )
         .setup(|app| {
@@ -2340,6 +2403,26 @@ fn main() {
                 notified: Mutex::new(HashSet::new()),
                 first_open_date,
             });
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                let theme = app
+                    .state::<AppState>()
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| {
+                        db.query_row(
+                            "SELECT value FROM metadata WHERE key='theme_mode'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                    })
+                    .unwrap_or_else(|| "auto".to_string());
+                let _ = set_native_titlebar_theme(&window, &theme);
+            }
             tray(app)?;
             let handle = app.handle().clone();
             #[cfg(windows)]
@@ -2444,6 +2527,7 @@ fn main() {
             import_backup,
             export_csv,
             get_settings,
+            set_theme_mode,
             save_attendance_settings,
             set_notification_settings,
             check_for_updates,
@@ -2457,7 +2541,7 @@ fn main() {
         ]);
     builder
         .run(tauri::generate_context!())
-        .expect("启动考勤记录程序失败");
+        .expect("启动考勤管理程序失败");
 }
 
 fn sync_initial_history(app: &AppHandle, first_open_date: NaiveDate) {
