@@ -1,7 +1,7 @@
 {
   "name": "mycardrecord",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "个人本地考勤与加班记录工具",
   "scripts": {
     "tauri": "tauri",

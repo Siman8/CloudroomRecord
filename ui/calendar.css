@@ -2,7 +2,7 @@
 .calendar-panel{padding:22px 24px}
 .calendar-toolbar{margin-bottom:21px}
 .weekday-row{padding:0 0 11px;border-bottom:0;font-size:11px;font-weight:600}
-.weekday-row span:nth-child(6),.weekday-row span:nth-child(7){color:#d85d59}
+.weekday-row span:first-child,.weekday-row span:nth-child(7){color:#d85d59}
 .month-grid{gap:5px;grid-auto-rows:minmax(94px,auto)}
 .calendar-cell{position:relative;display:flex;flex-direction:column;align-items:stretch;gap:3px;padding:9px 8px 7px;border:1px solid transparent;border-radius:7px;background:#fff;text-align:left;transition:background .12s,border-color .12s;overflow:hidden}
 .calendar-cell:nth-child(7n){border-right:1px solid transparent}
@@ -11,26 +11,29 @@
 .calendar-cell.today:not(.selected){box-shadow:inset 0 0 0 1px #97c7ad}
 .calendar-cell.outside{opacity:.43}
 .calendar-cell.weekend .cell-day{color:#d85d59}
-.calendar-cell.marked.holiday{background:#fff5f4}
-.calendar-cell.marked.makeup{background:#f0f7ff}
-.calendar-cell.marked.company{background:#f2f5fa}
+.calendar-cell:not(.marked){background:#fff}
+.calendar-cell:not(.marked):not(.weekend){background:#f1f8f3}
+.calendar-cell.marked.holiday{background:#fff1ef}
+.calendar-cell.marked.makeup,.calendar-cell.marked.company{background:#edf3f8}
 .calendar-cell.marked.manual-day{background:#f7f4ff}
+.calendar-cell.alert{background:#fff1ef}
+.calendar-cell.selected.alert{background:#fff1ef}
+.calendar-cell.alert.workday,.calendar-cell.selected.alert.workday{background:#fff0dc}
 .cell-head{display:flex;align-items:center;justify-content:space-between;min-height:20px}
 .calendar-cell .cell-day{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;color:#29332e}
 .calendar-cell.weekend .cell-day{color:#d85d59}
 .cell-marker{flex:none;border-radius:3px;padding:2px 5px;font-size:9px;line-height:1.2;font-weight:700;color:#fff;background:#718078}
 .cell-marker.holiday{background:#e9635d}
-.cell-marker.makeup{background:#3981c3}
-.cell-marker.company{background:#697c98}
+.cell-marker.makeup,.cell-marker.company{background:#697c98}
 .cell-marker.manual-day{background:#8b6ab2}
 .cell-name{display:block;min-height:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#a45c56;font-size:10px}
 .calendar-cell .cell-time{margin-top:auto;padding-top:4px;font-size:10px;color:#59665f;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.calendar-cell .cell-ot{align-self:flex-start;margin-top:1px;border-radius:4px;padding:2px 5px;font-size:9px;font-weight:600}
+.calendar-cell .cell-ot{align-self:flex-start;margin-top:1px;border-radius:4px;padding:2px 5px;font-size:9px;font-weight:600;background:#fff0dc;color:#9a5b12}
 .cell-status{font-size:9px;color:#ac554d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .calendar-cell.alert::after{position:absolute;right:6px;top:31px;margin:0}
 .calendar-legend{gap:9px 12px;margin:18px 0 16px}
 .calendar-legend i{width:9px;height:9px;border-radius:3px}
-.legend-holiday{background:#e9635d}.legend-makeup{background:#3981c3}.legend-company{background:#697c98}
+.legend-holiday{background:#e9635d}.legend-makeup,.legend-company{background:#697c98}
 .button:disabled{opacity:.48;cursor:not-allowed}
 .calendar-actions{display:grid;gap:8px;margin-top:14px}.company-day-label{font-size:10px;color:#68756f;margin:3px 0 -4px}.calendar-actions input[type=date]{width:100%;height:34px;padding:0 9px;border:1px solid #dfe6e2;border-radius:5px;background:#fff;font:12px inherit;color:#27332d}
 .top-actions.hidden{display:none}

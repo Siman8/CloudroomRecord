@@ -10,15 +10,15 @@ const $ = (id) => document.getElementById(id);
 const APP_VERSION = '1.0.6';
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
-const today = new Date();
-let selected = isoDate(today);
-let viewMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+let selected = isoDate(new Date());
+let viewMonth = (() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), 1); })();
 let monthRecords = [];
 let currentRecord = null;
 let toastTimer;
 let liveOvertimeExpectedEnd = null;
 let liveOvertimeBaseMinutes = 0;
 const monthSyncInFlight = new Map();
+let updateCheckInFlight = null;
 
 function setToast(message, type = 'success') {
   const el = $('toast'); el.textContent = message; el.className = `toast show ${type}`;
@@ -48,7 +48,9 @@ function showView(name) {
   if (name === 'settings') loadSettings();
 }
 function focusToday() {
-  selected = isoDate(new Date());
+  const now = new Date();
+  selected = isoDate(now);
+  viewMonth = new Date(now.getFullYear(), now.getMonth(), 1);
   $('selected-date').value = selected;
   showView('today');
   loadRecord();
@@ -56,7 +58,7 @@ function focusToday() {
 async function loadRecord() {
   $('selected-date').value = selected;
   $('today-long-date').textContent = prettyDate(selected);
-  $('banner-title').textContent = selected === isoDate(today) ? '今天的考勤' : `${selected} 的考勤`;
+  $('banner-title').textContent = selected === isoDate(new Date()) ? '今天的考勤' : `${selected} 的考勤`;
   try {
     const result = await invoke('get_record', {day:selected});
     currentRecord = result.record;
@@ -147,7 +149,7 @@ async function setCompanyWorkday() {
 }
 function renderMonth() {
   const first = new Date(viewMonth.getFullYear(),viewMonth.getMonth(),1);
-  const offset = (first.getDay()+6)%7;
+  const offset = first.getDay();
   const gridStart = new Date(first); gridStart.setDate(1-offset);
   const byDay = new Map(monthRecords.map(r=>[r.day,r]));
   const cells=[];
@@ -156,13 +158,14 @@ function renderMonth() {
     const outside=d.getMonth()!==viewMonth.getMonth();
     const alert=r && isAnomaly(r.status);
     const weekend=d.getDay()===0||d.getDay()===6;
+    const workday=r?.day_type==='workday';
     const marker=r?.calendar_marker||'';
     const markerClass=marker==='休'?'holiday':marker==='班'?'makeup':marker==='公司'?'company':'manual-day';
     const endLabel=r?.status==='整夜未锁'||!r?.end_time?'未锁':r.end_time;
     const timeLabel=r?.start_time?`${r.start_time} → ${endLabel}`:(r?.status==='整夜未锁'?'未锁':'');
     const holidayName=r?.calendar_name?`<span class="cell-name">${escapeHtml(r.calendar_name)}</span>`:'';
     const title=[r?.calendar_name,marker==='公司'?'公司固定上班':marker==='调'?'手动调整':null,r?.status].filter(Boolean).join(' · ');
-    cells.push(`<button class="calendar-cell ${outside?'outside':''} ${weekend?'weekend':''} ${key===selected?'selected':''} ${key===isoDate(new Date())?'today':''} ${alert?'alert':''} ${marker?`marked ${markerClass}`:''}" data-day="${key}" title="${escapeHtml(title)}"><span class="cell-head"><span class="cell-day">${d.getDate()}</span>${marker?`<span class="cell-marker ${markerClass}">${escapeHtml(marker)}</span>`:''}</span>${holidayName}${timeLabel?`<span class="cell-time">${escapeHtml(timeLabel)}</span>`:''}${r?.overtime_minutes?`<span class="cell-ot">加班 ${r.overtime_minutes/60}h</span>`:''}${alert?`<span class="cell-status">${escapeHtml(r.status)}</span>`:''}</button>`);
+    cells.push(`<button class="calendar-cell ${outside?'outside':''} ${weekend?'weekend':''} ${workday?'workday':''} ${key===selected?'selected':''} ${key===isoDate(new Date())?'today':''} ${alert?'alert':''} ${marker?`marked ${markerClass}`:''}" data-day="${key}" title="${escapeHtml(title)}"><span class="cell-head"><span class="cell-day">${d.getDate()}</span>${marker?`<span class="cell-marker ${markerClass}">${escapeHtml(marker)}</span>`:''}</span>${holidayName}${timeLabel?`<span class="cell-time">${escapeHtml(timeLabel)}</span>`:''}${r?.overtime_minutes?`<span class="cell-ot">加班 ${r.overtime_minutes/60}h</span>`:''}${alert?`<span class="cell-status">${escapeHtml(r.status)}</span>`:''}</button>`);
   }
   $('month-grid').innerHTML=cells.join('');
   $('month-grid').querySelectorAll('[data-day]').forEach(el=>el.addEventListener('click',()=>{selected=el.dataset.day;loadRecord();renderMonth();showView('today');}));
@@ -195,7 +198,23 @@ async function loadSettings() {
     return s;
   } catch(e) { setToast(String(e),'error'); return null; }
 }
-async function checkForUpdates(silent = false) {
+function checkForUpdates(silent = false) {
+  if (updateCheckInFlight) {
+    if (!silent) {
+      $('update-dialog').classList.remove('hidden');
+      $('update-status').textContent = '正在连接 GitHub 检查最新版本…';
+      return updateCheckInFlight.then(release => {
+        if (release && !release.update_available) {
+          $('update-status').textContent = `当前版本 ${release.current_version} 已是最新版本。`;
+        }
+      });
+    }
+    return updateCheckInFlight;
+  }
+  updateCheckInFlight = checkForUpdatesOnce(silent).finally(() => { updateCheckInFlight = null; });
+  return updateCheckInFlight;
+}
+async function checkForUpdatesOnce(silent = false) {
   const status = $('update-status');
   const notes = $('update-notes');
   const open = $('update-open');
@@ -210,11 +229,11 @@ async function checkForUpdates(silent = false) {
   fallback.classList.add('hidden');
   progress.classList.add('hidden');
   try {
-    await invoke('mark_updates_checked');
     const release = await invoke('check_for_updates');
+    await invoke('mark_updates_checked');
     if (!release.update_available) {
       if (!silent) status.textContent = `当前版本 ${release.current_version} 已是最新版本。`;
-      return;
+      return release;
     }
     $('update-dialog').classList.remove('hidden');
     status.textContent = `发现新版本 ${release.latest_version}（当前版本 ${release.current_version}）。`;
@@ -227,8 +246,10 @@ async function checkForUpdates(silent = false) {
     open.dataset.downloadUrl = release.download_url;
     open.dataset.digest = release.digest || '';
     open.classList.remove('hidden');
+    return release;
   } catch (error) {
     if (!silent) status.textContent = `检查失败：${String(error)}`;
+    return null;
   }
 }
 async function downloadUpdate() {
@@ -317,7 +338,12 @@ $('intro-confirm').addEventListener('click',async()=>{
   try { await invoke('complete_intro'); $('intro-dialog').classList.add('hidden'); }
   catch (error) { setToast(String(error),'error'); }
 });
-$('check-updates').addEventListener('click',()=>checkForUpdates(false));
+$('check-updates').addEventListener('click',async()=>{
+  const button=$('check-updates');
+  button.disabled=true;
+  try { await checkForUpdates(false); }
+  finally { button.disabled=false; }
+});
 $('update-close').addEventListener('click',()=>$('update-dialog').classList.add('hidden'));
 $('update-open').addEventListener('click',downloadUpdate);
 $('update-fallback').addEventListener('click',async()=>{

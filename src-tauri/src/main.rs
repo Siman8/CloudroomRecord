@@ -1502,7 +1502,13 @@ fn update_agent(url: &str, connect_timeout: u64, read_timeout: u64) -> Result<ur
 }
 
 #[tauri::command]
-fn check_for_updates() -> Result<serde_json::Value, String> {
+async fn check_for_updates() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(check_for_updates_blocking)
+        .await
+        .map_err(|error| format!("更新检查任务失败：{error}"))?
+}
+
+fn check_for_updates_blocking() -> Result<serde_json::Value, String> {
     let manifest_url =
         format!("https://github.com/{GITHUB_REPOSITORY}/releases/latest/download/latest.json");
     let response: serde_json::Value = update_agent(&manifest_url, 5, 10)?
@@ -1896,17 +1902,19 @@ fn poll_and_notify(app: &AppHandle) {
                         .is_some_and(|settings| settings.notify_at_end)
                         && day == now.date()
                         && now >= expected
-                        && now < expected + Duration::minutes(5)
+                        && now < expected + Duration::hours(12)
                         && claim_notification(&db, &key)
                     {
-                        notify(
-                            app,
-                            "下班时间到了",
-                            &format!(
-                                "今天预计下班时间是 {}。",
-                                record.expected_end.unwrap_or_default()
-                            ),
-                        );
+                        let message = settings
+                            .as_ref()
+                            .map(|settings| end_notification_message(&record, settings))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "今天预计下班时间是 {}。",
+                                    record.expected_end.as_deref().unwrap_or_default()
+                                )
+                            });
+                        notify(app, "下班时间到了", &message);
                     }
                 }
                 if record.status == "整夜未锁" {
@@ -1922,6 +1930,35 @@ fn poll_and_notify(app: &AppHandle) {
             }
         }
     };
+}
+
+fn end_notification_message(record: &DailyRecord, settings: &AttendanceSettings) -> String {
+    let mut message = format!(
+        "今天预计下班时间是 {}。",
+        record.expected_end.as_deref().unwrap_or_default()
+    );
+    if record.day_type == "workday" {
+        if let Some(start) = record
+            .start_time
+            .as_deref()
+            .and_then(|value| parse_clock_time(value).ok())
+        {
+            if arrival_is_late(start, settings) {
+                let allowed_until = settings.work_start
+                    + Duration::minutes(if settings.flexible_enabled {
+                        settings.flexible_minutes
+                    } else {
+                        0
+                    });
+                message.push_str(&format!(
+                    "早上迟到异常：首次解锁 {}，超过允许上班时间 {}。",
+                    start.format("%H:%M:%S"),
+                    allowed_until.format("%H:%M"),
+                ));
+            }
+        }
+    }
+    message
 }
 
 fn notify_first_unlock(app: &AppHandle, event: &RawEvent) {
@@ -1946,12 +1983,193 @@ fn notify_first_unlock(app: &AppHandle, event: &RawEvent) {
     }
     let key = format!("{}:first-unlock", day);
     if claim_notification(&db, &key) {
+        let start = local.time();
+        let expected_end = expected_end_for_start(day, start, &settings);
         notify(
             app,
             "今日首次解锁已记录",
-            &format!("首次解锁时间：{}。", local.format("%H:%M:%S")),
+            &first_unlock_message(start, expected_end, &settings),
         );
     }
+}
+
+fn arrival_is_late(start: NaiveTime, settings: &AttendanceSettings) -> bool {
+    let allowed_minutes = if settings.flexible_enabled {
+        settings.flexible_minutes
+    } else {
+        0
+    };
+    start > settings.work_start + Duration::minutes(allowed_minutes)
+}
+
+fn expected_end_for_start(
+    day: NaiveDate,
+    start: NaiveTime,
+    settings: &AttendanceSettings,
+) -> NaiveDateTime {
+    let late_minutes = (start - settings.work_start).num_minutes().max(0);
+    day.and_time(settings.work_end)
+        + Duration::minutes(if settings.flexible_enabled {
+            late_minutes.min(settings.flexible_minutes)
+        } else {
+            0
+        })
+}
+
+fn first_unlock_message(
+    start: NaiveTime,
+    expected_end: NaiveDateTime,
+    settings: &AttendanceSettings,
+) -> String {
+    let start_text = start.format("%H:%M:%S");
+    let expected_text = expected_end.format("%H:%M");
+    if arrival_is_late(start, settings) {
+        let allowed_until = settings.work_start
+            + Duration::minutes(if settings.flexible_enabled {
+                settings.flexible_minutes
+            } else {
+                0
+            });
+        format!(
+            "首次解锁时间：{start_text}。已超过允许上班时间（{allowed_until}），请注意迟到异常。预计下班时间：{expected_text}。"
+        )
+    } else {
+        format!("首次解锁时间：{start_text}。预计下班时间：{expected_text}。")
+    }
+}
+
+fn notify_on_session_unlock(app: &AppHandle) {
+    let now = Local::now();
+    let day = now.date_naive();
+    let state = app.state::<AppState>();
+    let Ok(db) = state.db.lock() else {
+        return;
+    };
+    let Ok(settings) = read_attendance_settings(&db) else {
+        return;
+    };
+    if !settings.notify_first_unlock || day_type(&db, day).ok().as_deref() != Some("workday") {
+        return;
+    }
+    let mut statement = match db.prepare("SELECT data FROM raw_events WHERE day=?1") {
+        Ok(statement) => statement,
+        Err(_) => return,
+    };
+    let rows = match statement.query_map([day.to_string()], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    for json in rows.flatten() {
+        if let Ok(event) = serde_json::from_str::<RawEvent>(&json) {
+            if event.kind == "unlock"
+                && chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                    .ok()
+                    .is_some_and(|timestamp| timestamp.with_timezone(&Local).date_naive() == day)
+            {
+                return;
+            }
+        }
+    }
+    let key = format!("{day}:first-unlock");
+    if claim_notification(&db, &key) {
+        let start = now.time();
+        let expected_end = expected_end_for_start(day, start, &settings);
+        notify(
+            app,
+            "今日首次解锁已记录",
+            &first_unlock_message(start, expected_end, &settings),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn listen_for_session_unlock(app: AppHandle) -> Result<(), String> {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
+            WNDCLASSW,
+        },
+    };
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        use windows_sys::Win32::{
+            System::RemoteDesktop::WTSUnRegisterSessionNotification,
+            UI::WindowsAndMessaging::{DefWindowProcW, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK},
+        };
+        if message == WM_WTSSESSION_CHANGE && wparam as u32 == WTS_SESSION_UNLOCK {
+            if let Some(app) = APP.get() {
+                notify_on_session_unlock(app);
+                let app = app.clone();
+                thread::spawn(move || sync_recent_events(&app, true));
+            }
+            return 0;
+        }
+        if message == 0x0002 {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
+        }
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+
+    APP.set(app)
+        .map_err(|_| "解锁事件监听器重复初始化".to_string())?;
+    const CLASS_NAME: &[u16] = &[
+        67, 108, 111, 117, 100, 114, 111, 111, 109, 82, 101, 99, 111, 114, 100, 85, 110, 108, 111,
+        99, 107, 0,
+    ];
+    unsafe {
+        let instance =
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        let class = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(window_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: CLASS_NAME.as_ptr(),
+        };
+        if RegisterClassW(&class) == 0 {
+            return Err("注册 Windows 解锁事件窗口失败".into());
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            CLASS_NAME.as_ptr(),
+            CLASS_NAME.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return Err("创建 Windows 解锁事件窗口失败".into());
+        }
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
+            return Err("订阅 Windows 解锁通知失败".into());
+        }
+        let mut message = std::mem::zeroed();
+        while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    Ok(())
 }
 
 fn notification_scheduler(app: AppHandle, wake: mpsc::Receiver<()>) {
@@ -2124,6 +2342,21 @@ fn main() {
             });
             tray(app)?;
             let handle = app.handle().clone();
+            #[cfg(windows)]
+            {
+                let unlock_handle = handle.clone();
+                thread::spawn(move || {
+                    if let Err(error) = listen_for_session_unlock(unlock_handle.clone()) {
+                        notify(
+                            &unlock_handle,
+                            "解锁通知监听失败",
+                            &format!(
+                                "无法订阅 Windows 解锁事件：{error}。将使用后台事件同步作为补偿。"
+                            ),
+                        );
+                    }
+                });
+            }
             if is_first_open {
                 let history_handle = handle.clone();
                 thread::spawn(move || sync_initial_history(&history_handle, first_open_date));
@@ -2143,15 +2376,17 @@ fn main() {
                         Ok(is_focused) => {
                             foreground = is_focused;
                             if foreground {
-                                let _ = sync_recent_events(&event_sync_handle, true);
-                                next_sync = std::time::Instant::now() + StdDuration::from_secs(60);
-                            } else {
-                                next_sync =
-                                    std::time::Instant::now() + StdDuration::from_secs(2 * 60 * 60);
+                                let _ = sync_recent_events(&event_sync_handle, false);
                             }
+                            next_sync = std::time::Instant::now()
+                                + if foreground {
+                                    StdDuration::from_secs(60)
+                                } else {
+                                    StdDuration::from_secs(2 * 60 * 60)
+                                };
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let _ = sync_recent_events(&event_sync_handle, true);
+                            let _ = sync_recent_events(&event_sync_handle, false);
                             next_sync = std::time::Instant::now()
                                 + if foreground {
                                     StdDuration::from_secs(60)
@@ -2285,6 +2520,46 @@ mod tests {
             NaiveTime::from_hms_opt(18, 0, 0).unwrap()
         );
         assert!(parse_clock_time("").unwrap_err().contains("收到“”"));
+    }
+
+    #[test]
+    fn unlock_notification_marks_late_arrival_and_carries_expected_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let settings = AttendanceSettings::default();
+        let on_time = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let late = NaiveTime::from_hms_opt(9, 31, 0).unwrap();
+
+        assert!(!arrival_is_late(on_time, &settings));
+        assert!(arrival_is_late(late, &settings));
+        assert!(first_unlock_message(
+            late,
+            expected_end_for_start(day, late, &settings),
+            &settings
+        )
+        .contains("请注意迟到异常"));
+        assert!(first_unlock_message(
+            on_time,
+            expected_end_for_start(day, on_time, &settings),
+            &settings
+        )
+        .contains("预计下班时间：18:30"));
+
+        let record = DailyRecord {
+            day: day.to_string(),
+            day_type: "workday".into(),
+            calendar_name: None,
+            calendar_marker: None,
+            start_time: Some("09:31".into()),
+            expected_end: Some("18:30".into()),
+            end_time: None,
+            overtime_minutes: 0,
+            status: "迟到".into(),
+            manual: false,
+            note: String::new(),
+        };
+        let end_message = end_notification_message(&record, &settings);
+        assert!(end_message.starts_with("今天预计下班时间是 18:30。"));
+        assert!(end_message.contains("早上迟到异常"));
     }
 
     fn calendar_test_db() -> Connection {
