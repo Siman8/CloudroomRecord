@@ -29,6 +29,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const OVERNIGHT_CUTOFF: (u32, u32) = (2, 0);
 const OVERTIME_BOUNDARY_GRACE_MINUTES: i64 = 3;
+const MIN_OVERTIME_SESSION_MINUTES: i64 = 30;
 const EARLY_DEPARTURE_GRACE_MINUTES: i64 = 10;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPOSITORY: &str = "Siman8/CloudroomRecord";
@@ -375,10 +376,31 @@ fn calculate_day_with_settings(
     });
     let reached_cutoff = now >= cutoff(day);
     let workday = kind == "workday";
+    let mut unlock_session = None;
+    let mut qualified_overtime_end = None;
+    for (time, event_kind) in &instants {
+        if is_unlock(event_kind) {
+            unlock_session.get_or_insert(*time);
+        } else if is_lock(event_kind) {
+            if let Some(session_start) = unlock_session.take() {
+                if (*time - session_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES {
+                    qualified_overtime_end = Some(*time);
+                }
+            }
+        }
+    }
+    if reached_cutoff {
+        if let Some(session_start) = unlock_session {
+            let cutoff_time = cutoff(day);
+            if (cutoff_time - session_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES {
+                qualified_overtime_end = Some(cutoff_time);
+            }
+        }
+    }
     let late_minutes = start
         .map(|time| (time.time() - settings.work_start).num_minutes().max(0))
         .unwrap_or(0);
-    let expected = start.map(|_| {
+    let expected = workday.then_some(start).flatten().map(|_| {
         day.and_time(settings.work_end)
             + Duration::minutes(if settings.flexible_enabled {
                 late_minutes.min(settings.flexible_minutes)
@@ -421,7 +443,7 @@ fn calculate_day_with_settings(
         "进行中"
     }
     .to_string();
-    let calculation_end = completed_end.or_else(|| reached_cutoff.then(|| cutoff(day)));
+    let calculation_end = qualified_overtime_end;
     let raw_duration = match (start, calculation_end, expected, workday) {
         (Some(_start), Some(end), Some(expected), true) => end - expected,
         (Some(start), Some(end), _, false) => end - start,
@@ -2837,6 +2859,49 @@ mod tests {
         ];
         let record = calculate_day(day, "restday", &events, day.and_hms_opt(10, 0, 0).unwrap());
         assert_eq!(record.overtime_minutes, 30);
+        assert_eq!(record.expected_end, None);
+        assert_eq!(record.status, "正常");
+    }
+
+    #[test]
+    fn overtime_sessions_shorter_than_thirty_minutes_are_ignored() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        let events = vec![
+            event("2026-11-08T09:10:00", "unlock"),
+            event("2026-11-08T09:39:59", "lock"),
+        ];
+        let record = calculate_day(day, "restday", &events, day.and_hms_opt(10, 0, 0).unwrap());
+        assert_eq!(record.end_time.as_deref(), Some("09:39"));
+        assert_eq!(record.overtime_minutes, 0);
+    }
+
+    #[test]
+    fn short_remote_session_does_not_extend_prior_qualified_overtime() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T09:00:00", "unlock"),
+            event("2026-11-09T20:00:00", "lock"),
+            event("2026-11-09T22:00:00", "unlock"),
+            event("2026-11-09T22:20:00", "lock"),
+        ];
+        let record = calculate_day(day, "workday", &events, day.and_hms_opt(23, 0, 0).unwrap());
+        assert_eq!(record.end_time.as_deref(), Some("22:20"));
+        assert_eq!(record.overtime_minutes, 120);
+    }
+
+    #[test]
+    fn voluntary_rest_day_has_no_expected_end_or_early_departure_anomaly() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+        let events = vec![
+            event("2026-11-14T11:32:37", "unlock"),
+            event("2026-11-14T12:42:23", "lock"),
+        ];
+        let record = calculate_day(day, "restday", &events, day.and_hms_opt(13, 0, 0).unwrap());
+        assert_eq!(record.start_time.as_deref(), Some("11:32"));
+        assert_eq!(record.end_time.as_deref(), Some("12:42"));
+        assert_eq!(record.expected_end, None);
+        assert_eq!(record.status, "正常");
+        assert_eq!(record.overtime_minutes, 60);
     }
 
     #[test]

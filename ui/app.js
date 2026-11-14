@@ -7,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.9';
+const APP_VERSION = '1.0.10';
 const THEME_MODES = new Set(['auto', 'light', 'dark']);
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
@@ -19,6 +19,7 @@ let statsRecords = [];
 let currentRecord = null;
 let toastTimer;
 let liveOvertimeExpectedEnd = null;
+let liveOvertimeUnlockStart = null;
 let liveOvertimeBaseMinutes = 0;
 const monthSyncInFlight = new Map();
 let updateCheckInFlight = null;
@@ -92,6 +93,14 @@ function renderRecord(r, events) {
   liveOvertimeExpectedEnd = r.day_type === 'workday' && todayRecordIsOpen && r.expected_end
     ? new Date(`${selected}T${r.expected_end}:00`)
     : null;
+  const orderedEvents = [...events].sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp));
+  let activeUnlock = null;
+  for (const event of orderedEvents) {
+    const eventTime = new Date(event.timestamp);
+    if (event.kind === 'unlock' || event.kind === 'startup') activeUnlock ??= eventTime;
+    if (event.kind === 'lock' || event.kind === 'shutdown') activeUnlock = null;
+  }
+  liveOvertimeUnlockStart = todayRecordIsOpen ? activeUnlock : null;
   liveOvertimeBaseMinutes = r.overtime_minutes;
   updateLiveOvertime();
   const subtitles = {
@@ -122,6 +131,7 @@ function updateLiveOvertime() {
   if (!liveOvertimeExpectedEnd || Number.isNaN(liveOvertimeExpectedEnd.getTime())) return;
   const now = new Date();
   if (isoDate(now) !== selected) { liveOvertimeExpectedEnd = null; return; }
+  if (!liveOvertimeUnlockStart || Math.floor((now - liveOvertimeUnlockStart) / 1000) < 30 * 60) return;
   const elapsedSeconds = Math.floor((now - liveOvertimeExpectedEnd) / 1000);
   if (elapsedSeconds < 2 * 60 * 60) return;
   const intervalSeconds = 30 * 60;
