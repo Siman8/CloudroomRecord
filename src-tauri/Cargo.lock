@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "mycardrecord"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "chrono",
  "quick-xml 0.38.4",

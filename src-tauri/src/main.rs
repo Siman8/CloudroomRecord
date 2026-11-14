@@ -472,7 +472,7 @@ fn calculate_day_with_settings(
         calendar_marker: None,
         start_time: start.map(|v| v.format("%H:%M").to_string()),
         expected_end: expected.map(|v| v.format("%H:%M").to_string()),
-        end_time: end.map(|v| v.format("%H:%M").to_string()),
+        end_time: completed_end.map(|v| v.format("%H:%M").to_string()),
         overtime_minutes,
         status,
         manual: false,
@@ -3015,7 +3015,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_lock_remains_visible_when_followed_by_unlock() {
+    fn actual_end_is_unknown_when_a_later_unlock_keeps_day_open() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
         let events = vec![
             event("2026-11-10T09:09:00", "unlock"),
@@ -3023,7 +3023,8 @@ mod tests {
             event("2026-11-10T19:56:05", "unlock"),
         ];
         let record = calculate_day(day, "workday", &events, day.and_hms_opt(20, 0, 0).unwrap());
-        assert_eq!(record.end_time.as_deref(), Some("19:56"));
+        assert_eq!(record.end_time, None);
+        assert_eq!(record.status, "进行中");
         assert_eq!(record.status, "进行中");
         assert_eq!(record.overtime_minutes, 0);
     }

@@ -7,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.10';
+const APP_VERSION = '1.0.11';
 const THEME_MODES = new Set(['auto', 'light', 'dark']);
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
@@ -19,6 +19,8 @@ let statsRecords = [];
 let currentRecord = null;
 let toastTimer;
 let liveOvertimeExpectedEnd = null;
+let liveOvertimeDayType = null;
+let liveOvertimeDayStart = null;
 let liveOvertimeUnlockStart = null;
 let liveOvertimeBaseMinutes = 0;
 const monthSyncInFlight = new Map();
@@ -87,12 +89,6 @@ async function loadRecord() {
 function renderRecord(r, events) {
   $('metric-start').textContent = r.start_time || '--:--';
   $('metric-expected').textContent = r.expected_end || '--:--';
-  $('metric-end').textContent = r.end_time || '--:--';
-  $('metric-overtime').innerHTML = `${(r.overtime_minutes/60).toFixed(r.overtime_minutes%60 ? 1 : 0)}<span>小时</span>`;
-  const todayRecordIsOpen = selected === isoDate(new Date()) && r.status === '进行中' && !r.manual;
-  liveOvertimeExpectedEnd = r.day_type === 'workday' && todayRecordIsOpen && r.expected_end
-    ? new Date(`${selected}T${r.expected_end}:00`)
-    : null;
   const orderedEvents = [...events].sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp));
   let activeUnlock = null;
   for (const event of orderedEvents) {
@@ -100,6 +96,18 @@ function renderRecord(r, events) {
     if (event.kind === 'unlock' || event.kind === 'startup') activeUnlock ??= eventTime;
     if (event.kind === 'lock' || event.kind === 'shutdown') activeUnlock = null;
   }
+  const todayRecordIsOpen = selected === isoDate(new Date()) && !r.manual && activeUnlock !== null;
+  $('metric-end').textContent = todayRecordIsOpen ? '--:--' : (r.end_time || '--:--');
+  $('metric-overtime').innerHTML = `${(r.overtime_minutes/60).toFixed(r.overtime_minutes%60 ? 1 : 0)}<span>小时</span>`;
+  $('overtime-detail').textContent = r.day_type === 'workday'
+    ? '工作日需满2小时才计加班'
+    : '连续解锁满30分钟后计入加班';
+  liveOvertimeDayType = todayRecordIsOpen ? r.day_type : null;
+  liveOvertimeExpectedEnd = r.day_type === 'workday' && todayRecordIsOpen && r.expected_end
+    ? new Date(`${selected}T${r.expected_end}:00`)
+    : null;
+  const firstUnlock = orderedEvents.find(event => event.kind === 'unlock' || event.kind === 'startup');
+  liveOvertimeDayStart = todayRecordIsOpen && firstUnlock ? new Date(firstUnlock.timestamp) : null;
   liveOvertimeUnlockStart = todayRecordIsOpen ? activeUnlock : null;
   liveOvertimeBaseMinutes = r.overtime_minutes;
   updateLiveOvertime();
@@ -116,7 +124,7 @@ function renderRecord(r, events) {
   $('banner-subtitle').textContent = subtitles[r.status] || '记录存在缺失，可同步事件或手动补充';
   $('record-status').textContent = r.status; $('record-status').className = `status-pill ${statusClass(r.status)}`;
   $('day-type').value = r.manual ? r.day_type : (r.day_type || 'workday');
-  $('edit-start').value = r.start_time || ''; $('edit-end').value = r.end_time || '';
+  $('edit-start').value = r.start_time || ''; $('edit-end').value = todayRecordIsOpen ? '' : (r.end_time || '');
   $('edit-overtime').value = (r.overtime_minutes / 60) || 0; $('edit-note').value = r.note || '';
   $('source-note').textContent = r.manual ? '数据来源：人工修改' : '数据来源：系统事件 / 规则计算';
   $('event-count').textContent = `${events.length} 条`;
@@ -128,12 +136,23 @@ function renderRecord(r, events) {
   }).join('') : '<div class="empty-state">尚无锁屏、解锁或开关机事件<br>可同步系统记录，或直接填写当日时间</div>';
 }
 function updateLiveOvertime() {
-  if (!liveOvertimeExpectedEnd || Number.isNaN(liveOvertimeExpectedEnd.getTime())) return;
+  if (!liveOvertimeDayType) return;
   const now = new Date();
-  if (isoDate(now) !== selected) { liveOvertimeExpectedEnd = null; return; }
-  if (!liveOvertimeUnlockStart || Math.floor((now - liveOvertimeUnlockStart) / 1000) < 30 * 60) return;
-  const elapsedSeconds = Math.floor((now - liveOvertimeExpectedEnd) / 1000);
-  if (elapsedSeconds < 2 * 60 * 60) return;
+  if (isoDate(now) !== selected) { liveOvertimeDayType = null; return; }
+  if (!liveOvertimeUnlockStart) return;
+  const unlockedSeconds = Math.floor((now - liveOvertimeUnlockStart) / 1000);
+  if (unlockedSeconds < 30 * 60) {
+    $('overtime-detail').textContent = '连续解锁满30分钟后计入加班';
+    return;
+  }
+  const overtimeStart = liveOvertimeDayType === 'workday' ? liveOvertimeExpectedEnd : liveOvertimeDayStart;
+  if (!overtimeStart || Number.isNaN(overtimeStart.getTime())) return;
+  const elapsedSeconds = Math.floor((now - overtimeStart) / 1000);
+  if (liveOvertimeDayType === 'workday' && elapsedSeconds < 2 * 60 * 60) {
+    $('overtime-detail').textContent = '工作日需满2小时才计加班';
+    return;
+  }
+  if (elapsedSeconds <= 0) return;
   const intervalSeconds = 30 * 60;
   const intervals = Math.floor(elapsedSeconds / intervalSeconds);
   const countableMinutes = Math.max(liveOvertimeBaseMinutes, intervals * 30);
