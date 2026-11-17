@@ -7,7 +7,7 @@ const invoke = (command, args = {}) => {
   return tauriInvoke(command, args);
 };
 const $ = (id) => document.getElementById(id);
-const APP_VERSION = '1.0.11';
+const APP_VERSION = '1.0.12';
 const THEME_MODES = new Set(['auto', 'light', 'dark']);
 const pad = (n) => String(n).padStart(2, '0');
 function isoDate(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; }
@@ -17,6 +17,7 @@ let statsMonth = (() => { const now = new Date(); return new Date(now.getFullYea
 let monthRecords = [];
 let statsRecords = [];
 let currentRecord = null;
+let recordLoadSequence = 0;
 let toastTimer;
 let liveOvertimeExpectedEnd = null;
 let liveOvertimeDayType = null;
@@ -77,14 +78,19 @@ function focusToday() {
   loadRecord();
 }
 async function loadRecord() {
-  $('selected-date').value = selected;
-  $('today-long-date').textContent = prettyDate(selected);
-  $('banner-title').textContent = selected === isoDate(new Date()) ? '今天的考勤' : `${selected} 的考勤`;
+  const requestedDay = selected;
+  const sequence = ++recordLoadSequence;
+  $('selected-date').value = requestedDay;
+  $('today-long-date').textContent = prettyDate(requestedDay);
+  $('banner-title').textContent = requestedDay === isoDate(new Date()) ? '今天的考勤' : `${requestedDay} 的考勤`;
   try {
-    const result = await invoke('get_record', {day:selected});
+    const result = await invoke('get_record', {day:requestedDay});
+    if (sequence !== recordLoadSequence || requestedDay !== selected) return;
     currentRecord = result.record;
     renderRecord(result.record, result.events || []);
-  } catch (e) { setToast(String(e), 'error'); }
+  } catch (e) {
+    if (sequence === recordLoadSequence && requestedDay === selected) setToast(String(e), 'error');
+  }
 }
 function renderRecord(r, events) {
   $('metric-start').textContent = r.start_time || '--:--';
@@ -439,9 +445,9 @@ function renderDownloadProgress(event){
     $('update-status').textContent=`正在下载更新：${(downloaded/1048576).toFixed(1)} MB`;
   }
 }
-window.addEventListener('tauri://focus-today',focusToday);
 window.addEventListener('DOMContentLoaded',async()=>{
   if (tauriListen) await tauriListen('update-download-progress', renderDownloadProgress);
+  if (tauriListen) await tauriListen('window-focused', focusToday);
   if (tauriListen) await tauriListen('calendar-updated', async()=>{
     await loadSettings();
     await loadMonth();

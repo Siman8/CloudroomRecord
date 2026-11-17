@@ -12,7 +12,7 @@ use std::{
     process::Command,
     sync::{mpsc, Mutex},
     thread,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -38,6 +38,7 @@ struct AppState {
     db: Mutex<Connection>,
     notified: Mutex<HashSet<String>>,
     first_open_date: NaiveDate,
+    background_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2352,10 +2353,16 @@ fn sync_recent_events(app: &AppHandle, allow_first_unlock_notification: bool) {
 
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let should_switch_to_today = app
+            .try_state::<AppState>()
+            .and_then(|state| state.background_since.lock().ok()?.take())
+            .is_some_and(|started| started.elapsed() >= StdDuration::from_secs(60 * 60));
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        let _ = window.emit("tauri://focus-today", ());
+        if should_switch_to_today {
+            let _ = app.emit("window-focused", ());
+        }
     }
 }
 
@@ -2424,6 +2431,7 @@ fn main() {
                 db: Mutex::new(db),
                 notified: Mutex::new(HashSet::new()),
                 first_open_date,
+                background_since: Mutex::new(None),
             });
             #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main") {
@@ -2528,11 +2536,29 @@ fn main() {
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
+                if let Some(state) = window.app_handle().try_state::<AppState>() {
+                    if let Ok(mut background_since) = state.background_since.lock() {
+                        *background_since = Some(Instant::now());
+                    }
+                }
                 let _ = window.hide();
             }
             tauri::WindowEvent::Focused(focused) => {
                 if let Some(sender) = window.app_handle().try_state::<mpsc::Sender<bool>>() {
                     let _ = sender.send(*focused);
+                }
+                if *focused {
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        if let Ok(mut background_since) = state.background_since.lock() {
+                            background_since.take();
+                        }
+                    }
+                } else if window.is_minimized().unwrap_or(false) {
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        if let Ok(mut background_since) = state.background_since.lock() {
+                            *background_since = Some(Instant::now());
+                        }
+                    }
                 }
             }
             _ => {}
