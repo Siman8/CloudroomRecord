@@ -230,12 +230,13 @@ function renderMonth() {
     const weekend=d.getDay()===0||d.getDay()===6;
     const workday=r?.day_type==='workday';
     const marker=r?.calendar_marker||'';
+    const showMarker=marker&&marker!=='调';
     const markerClass=marker==='休'?'holiday':marker==='班'?'makeup':marker==='公司'?'company':'manual-day';
     const endLabel=r?.status==='整夜未锁'||!r?.end_time?'未锁':r.end_time;
     const timeLabel=r?.start_time?`${r.start_time} → ${endLabel}`:(r?.status==='整夜未锁'?'未锁':'');
     const holidayName=r?.calendar_name?`<span class="cell-name">${escapeHtml(r.calendar_name)}</span>`:'';
     const title=[r?.calendar_name,marker==='公司'?'公司固定上班':marker==='调'?'手动调整':null,r?.status].filter(Boolean).join(' · ');
-    cells.push(`<button class="calendar-cell ${outside?'outside':''} ${weekend?'weekend':''} ${workday?'workday':''} ${key===selected?'selected':''} ${key===isoDate(new Date())?'today':''} ${alert?'alert':''} ${marker?`marked ${markerClass}`:''}" data-day="${key}" title="${escapeHtml(title)}"><span class="cell-head"><span class="cell-day">${d.getDate()}</span>${marker?`<span class="cell-marker ${markerClass}">${escapeHtml(marker)}</span>`:''}</span>${holidayName}${timeLabel?`<span class="cell-time">${escapeHtml(timeLabel)}</span>`:''}${r?.overtime_minutes?`<span class="cell-ot">加班 ${r.overtime_minutes/60}h</span>`:''}${alert?`<span class="cell-status">${escapeHtml(r.status)}</span>`:''}</button>`);
+    cells.push(`<button class="calendar-cell ${outside?'outside':''} ${weekend?'weekend':''} ${workday?'workday':''} ${key===selected?'selected':''} ${key===isoDate(new Date())?'today':''} ${alert?'alert':''} ${marker?`marked ${markerClass}`:''}" data-day="${key}" title="${escapeHtml(title)}"><span class="cell-head"><span class="cell-day">${d.getDate()}</span>${showMarker?`<span class="cell-marker ${markerClass}">${escapeHtml(marker)}</span>`:''}</span>${holidayName}${timeLabel?`<span class="cell-time">${escapeHtml(timeLabel)}</span>`:''}${r?.overtime_minutes?`<span class="cell-ot">加班 ${r.overtime_minutes/60}h</span>`:''}${alert?`<span class="cell-status">${escapeHtml(r.status)}</span>`:''}</button>`);
   }
   $('month-grid').innerHTML=cells.join('');
   $('month-grid').querySelectorAll('[data-day]').forEach(el=>el.addEventListener('click',()=>{selected=el.dataset.day;loadRecord();renderMonth();showView('today');}));

@@ -378,14 +378,24 @@ fn calculate_day_with_settings(
     let reached_cutoff = now >= cutoff(day);
     let workday = kind == "workday";
     let mut unlock_session = None;
-    let mut qualified_overtime_end = None;
+    let mut has_qualified_overtime_session = false;
+    let expected_for_sessions = if workday {
+        start.map(|time| expected_end_for_start(day, time.time(), settings))
+    } else {
+        None
+    };
     for (time, event_kind) in &instants {
         if is_unlock(event_kind) {
             unlock_session.get_or_insert(*time);
         } else if is_lock(event_kind) {
             if let Some(session_start) = unlock_session.take() {
-                if (*time - session_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES {
-                    qualified_overtime_end = Some(*time);
+                let overtime_start = expected_for_sessions
+                    .map(|expected| session_start.max(expected))
+                    .unwrap_or(session_start);
+                if *time > overtime_start
+                    && (*time - overtime_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES
+                {
+                    has_qualified_overtime_session = true;
                 }
             }
         }
@@ -393,22 +403,24 @@ fn calculate_day_with_settings(
     if reached_cutoff {
         if let Some(session_start) = unlock_session {
             let cutoff_time = cutoff(day);
-            if (cutoff_time - session_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES {
-                qualified_overtime_end = Some(cutoff_time);
+            let overtime_start = expected_for_sessions
+                .map(|expected| session_start.max(expected))
+                .unwrap_or(session_start);
+            if cutoff_time > overtime_start
+                && (cutoff_time - overtime_start).num_minutes() >= MIN_OVERTIME_SESSION_MINUTES
+            {
+                has_qualified_overtime_session = true;
             }
         }
     }
     let late_minutes = start
         .map(|time| (time.time() - settings.work_start).num_minutes().max(0))
         .unwrap_or(0);
-    let expected = workday.then_some(start).flatten().map(|_| {
-        day.and_time(settings.work_end)
-            + Duration::minutes(if settings.flexible_enabled {
-                late_minutes.min(settings.flexible_minutes)
-            } else {
-                0
-            })
-    });
+    let expected = if workday {
+        start.map(|time| expected_end_for_start(day, time.time(), settings))
+    } else {
+        None
+    };
     let late_outside_flex = if settings.flexible_enabled {
         late_minutes > settings.flexible_minutes
     } else {
@@ -444,7 +456,9 @@ fn calculate_day_with_settings(
         "进行中"
     }
     .to_string();
-    let calculation_end = qualified_overtime_end;
+    let calculation_end = has_qualified_overtime_session
+        .then(|| end.or_else(|| reached_cutoff.then_some(cutoff(day))))
+        .flatten();
     let raw_duration = match (start, calculation_end, expected, workday) {
         (Some(_start), Some(end), Some(expected), true) => end - expected,
         (Some(start), Some(end), _, false) => end - start,
@@ -2093,10 +2107,10 @@ fn expected_end_for_start(
     start: NaiveTime,
     settings: &AttendanceSettings,
 ) -> NaiveDateTime {
-    let late_minutes = (start - settings.work_start).num_minutes().max(0);
+    let offset_minutes = (start - settings.work_start).num_minutes();
     day.and_time(settings.work_end)
         + Duration::minutes(if settings.flexible_enabled {
-            late_minutes.min(settings.flexible_minutes)
+            offset_minutes.clamp(-settings.flexible_minutes, settings.flexible_minutes)
         } else {
             0
         })
@@ -2902,7 +2916,7 @@ mod tests {
     }
 
     #[test]
-    fn short_remote_session_does_not_extend_prior_qualified_overtime() {
+    fn short_final_session_uses_its_last_lock_after_overtime_qualifies() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
         let events = vec![
             event("2026-11-09T09:00:00", "unlock"),
@@ -2912,6 +2926,34 @@ mod tests {
         ];
         let record = calculate_day(day, "workday", &events, day.and_hms_opt(23, 0, 0).unwrap());
         assert_eq!(record.end_time.as_deref(), Some("22:20"));
+        assert_eq!(record.overtime_minutes, 240);
+    }
+
+    #[test]
+    fn short_final_session_uses_last_lock_after_overtime_is_qualified() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 17).unwrap();
+        let events = vec![
+            event("2026-11-17T09:20:00", "unlock"),
+            event("2026-11-17T20:17:41", "lock"),
+            event("2026-11-17T20:17:44", "unlock"),
+            event("2026-11-17T20:22:02", "lock"),
+        ];
+        let settings = AttendanceSettings {
+            work_start: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(17, 30, 0).unwrap(),
+            flexible_enabled: true,
+            flexible_minutes: 60,
+            ..AttendanceSettings::default()
+        };
+        let record = calculate_day_with_settings(
+            day,
+            "workday",
+            &events,
+            day.and_hms_opt(21, 0, 0).unwrap(),
+            &settings,
+        );
+        assert_eq!(record.expected_end.as_deref(), Some("18:20"));
+        assert_eq!(record.end_time.as_deref(), Some("20:22"));
         assert_eq!(record.overtime_minutes, 120);
     }
 
@@ -2980,14 +3022,64 @@ mod tests {
     }
 
     #[test]
-    fn configured_schedule_keeps_early_unlock_from_advancing_expected_end() {
+    fn configured_schedule_moves_expected_end_earlier_for_early_unlock() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
         let events = vec![
             event("2026-11-09T08:50:00", "unlock"),
             event("2026-11-09T18:05:00", "lock"),
         ];
         let record = calculate_day(day, "workday", &events, day.and_hms_opt(19, 0, 0).unwrap());
-        assert_eq!(record.expected_end.as_deref(), Some("18:00"));
+        assert_eq!(record.expected_end.as_deref(), Some("17:50"));
+        assert_eq!(record.status, "正常");
+    }
+
+    #[test]
+    fn early_unlock_advances_overtime_threshold_with_expected_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T08:50:00", "unlock"),
+            event("2026-11-09T19:50:00", "lock"),
+        ];
+        let settings = AttendanceSettings {
+            work_start: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(17, 30, 0).unwrap(),
+            flexible_enabled: true,
+            flexible_minutes: 60,
+            ..AttendanceSettings::default()
+        };
+        let record = calculate_day_with_settings(
+            day,
+            "workday",
+            &events,
+            day.and_hms_opt(20, 0, 0).unwrap(),
+            &settings,
+        );
+        assert_eq!(record.expected_end.as_deref(), Some("17:50"));
+        assert_eq!(record.overtime_minutes, 120);
+    }
+
+    #[test]
+    fn early_departure_is_judged_against_shifted_expected_end() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let events = vec![
+            event("2026-11-09T08:50:00", "unlock"),
+            event("2026-11-09T17:45:00", "lock"),
+        ];
+        let settings = AttendanceSettings {
+            work_start: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(17, 30, 0).unwrap(),
+            flexible_enabled: true,
+            flexible_minutes: 60,
+            ..AttendanceSettings::default()
+        };
+        let record = calculate_day_with_settings(
+            day,
+            "workday",
+            &events,
+            day.and_hms_opt(18, 0, 0).unwrap(),
+            &settings,
+        );
+        assert_eq!(record.expected_end.as_deref(), Some("17:50"));
         assert_eq!(record.status, "正常");
     }
 
