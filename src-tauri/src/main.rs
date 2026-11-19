@@ -440,10 +440,7 @@ fn calculate_day_with_settings(
     } else if completed_end.is_some() {
         if workday
             && completed_end.zip(expected).is_some_and(|(end, expected)| {
-                let ended_early = end.time() <= settings.work_end
-                    || (end < expected
-                        && (expected - end).num_minutes() > EARLY_DEPARTURE_GRACE_MINUTES);
-                ended_early
+                end < expected && (expected - end).num_minutes() > EARLY_DEPARTURE_GRACE_MINUTES
             })
         {
             "提前下班"
@@ -2107,7 +2104,7 @@ fn expected_end_for_start(
     start: NaiveTime,
     settings: &AttendanceSettings,
 ) -> NaiveDateTime {
-    let offset_minutes = (start - settings.work_start).num_minutes();
+    let offset_minutes = (start - settings.work_start).num_minutes().max(0);
     day.and_time(settings.work_end)
         + Duration::minutes(if settings.flexible_enabled {
             offset_minutes.clamp(-settings.flexible_minutes, settings.flexible_minutes)
@@ -2986,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn early_departure_grace_requires_after_six_pm() {
+    fn early_departure_grace_uses_configured_end_as_minimum() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
         let within_grace = vec![
             event("2026-11-09T09:10:00", "unlock"),
@@ -3006,7 +3003,7 @@ mod tests {
             event("2026-11-09T18:00:00", "lock"),
         ];
         let record = calculate_day(day, "workday", &at_six, day.and_hms_opt(19, 0, 0).unwrap());
-        assert_eq!(record.status, "提前下班");
+        assert_eq!(record.status, "正常");
 
         let outside_grace = vec![
             event("2026-11-09T09:10:00", "unlock"),
@@ -3018,18 +3015,18 @@ mod tests {
             &outside_grace,
             day.and_hms_opt(19, 0, 0).unwrap(),
         );
-        assert_eq!(record.status, "提前下班");
+        assert_eq!(record.status, "正常");
     }
 
     #[test]
-    fn configured_schedule_moves_expected_end_earlier_for_early_unlock() {
+    fn configured_schedule_keeps_expected_end_at_configured_end_for_early_unlock() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
         let events = vec![
             event("2026-11-09T08:50:00", "unlock"),
             event("2026-11-09T18:05:00", "lock"),
         ];
         let record = calculate_day(day, "workday", &events, day.and_hms_opt(19, 0, 0).unwrap());
-        assert_eq!(record.expected_end.as_deref(), Some("17:50"));
+        assert_eq!(record.expected_end.as_deref(), Some("18:00"));
         assert_eq!(record.status, "正常");
     }
 
@@ -3092,6 +3089,29 @@ mod tests {
         ];
         let record = calculate_day(day, "workday", &events, day.and_hms_opt(19, 0, 0).unwrap());
         assert_eq!(record.expected_end.as_deref(), Some("18:28"));
+        assert_eq!(record.status, "正常");
+    }
+
+    #[test]
+    fn expected_end_never_precedes_configured_end_for_early_unlock() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+        let start = NaiveTime::from_hms_opt(8, 58, 32).unwrap();
+        let settings = AttendanceSettings::default();
+        assert_eq!(
+            expected_end_for_start(day, start, &settings),
+            day.and_hms_opt(18, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn early_departure_grace_applies_before_configured_end_too() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+        let events = vec![
+            event("2026-11-19T08:58:32", "unlock"),
+            event("2026-11-19T17:55:00", "lock"),
+        ];
+        let record = calculate_day(day, "workday", &events, day.and_hms_opt(18, 30, 0).unwrap());
+        assert_eq!(record.expected_end.as_deref(), Some("18:00"));
         assert_eq!(record.status, "正常");
     }
 
